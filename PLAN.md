@@ -9,16 +9,16 @@
 
 ## Фаза 0. Подготовка (один вечер, руками)
 
-- [ ] Создать бота у @BotFather и получить токен
+- [x] Создать бота у @BotFather и получить токен
   > 💡 Токен — пароль бота. Не кладём его ни в код, ни в GitHub.
-- [ ] Узнать свой Telegram user_id (например, через @userinfobot)
+- [x] Узнать свой Telegram user_id (например, через @userinfobot)
   > 💡 Нужен для whitelist: бот будет отвечать только тебе.
-- [ ] Создать новый проект в Supabase (регион EU)
-- [ ] Установить Supabase CLI, выполнить `supabase login` и `supabase link`
+- [x] Создать новый проект в Supabase (регион EU)
+- [x] Установить Supabase CLI, выполнить `supabase login` и `supabase link`
   > 💡 CLI — консольная утилита: через неё из VS Code заливаешь функции и миграции в облако.
-- [ ] Получить API-ключ Groq (console.groq.com)
-- [ ] Создать репозиторий на GitHub, положить `CLAUDE.md` и `PLAN.md`, добавить `.gitignore` с `.env`
-- [ ] Положить секреты в Supabase Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`
+- [x] Получить API-ключ Groq (console.groq.com)
+- [x] Создать репозиторий на GitHub, положить `CLAUDE.md` и `PLAN.md`, добавить `.gitignore` с `.env`
+- [x] Положить секреты в Supabase Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`
   > 💡 Секреты хранятся на стороне Supabase, код читает их как переменные окружения.
 
 ✅ **Готово, когда:** `supabase link` прошёл, секреты видны в панели Supabase.
