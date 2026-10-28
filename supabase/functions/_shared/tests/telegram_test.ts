@@ -1,0 +1,196 @@
+// Тесты хелперов Telegram: как бот показывает даты, карточку подтверждения,
+// список напоминаний и как кодирует данные кнопок.
+// Здесь нет сети и базы: все функции «чистые» (на тот же вход всегда тот же выход).
+
+import { deepStrictEqual as assertEquals } from "node:assert";
+import {
+  buildConfirmCard,
+  buildListMessage,
+  buildReminderMessage,
+  decodeCallback,
+  encodeCallback,
+  escapeHtml,
+  formatWhen,
+} from "../telegram.ts";
+
+const TZ = "Europe/Moscow";
+const NOW = new Date("2026-10-28T09:00:00Z"); // среда, 12:00 по Москве
+
+// --- Формат даты для человека ------------------------------------------------
+
+Deno.test("formatWhen: дата и время в поясе пользователя", () => {
+  // 08:00 UTC = 11:00 по Москве
+  assertEquals(
+    formatWhen(new Date("2026-10-29T08:00:00Z"), TZ, NOW),
+    "29.10 в 11:00",
+  );
+});
+
+Deno.test("formatWhen: нули спереди у дня, месяца, часа и минут", () => {
+  assertEquals(
+    formatWhen(new Date("2026-11-03T06:05:00Z"), TZ, NOW),
+    "03.11 в 09:05",
+  );
+});
+
+Deno.test("formatWhen: год показываем только если он не текущий", () => {
+  assertEquals(
+    formatWhen(new Date("2027-10-03T06:00:00Z"), TZ, NOW),
+    "03.10.2027 в 09:00",
+  );
+});
+
+Deno.test("formatWhen: учитывает пояс (Екатеринбург, UTC+5)", () => {
+  assertEquals(
+    formatWhen(new Date("2026-10-29T06:00:00Z"), "Asia/Yekaterinburg", NOW),
+    "29.10 в 11:00",
+  );
+});
+
+Deno.test("formatWhen: после полуночи по местному времени дата следующая", () => {
+  // 22:30 UTC = 01:30 по Москве уже следующего дня
+  assertEquals(
+    formatWhen(new Date("2026-10-28T22:30:00Z"), TZ, NOW),
+    "29.10 в 01:30",
+  );
+});
+
+// --- Защита от «ломающих» символов -------------------------------------------
+
+Deno.test("escapeHtml: экранирует < > &", () => {
+  assertEquals(
+    escapeHtml("<b>Тор & Ко</b>"),
+    "&lt;b&gt;Тор &amp; Ко&lt;/b&gt;",
+  );
+});
+
+// --- Данные кнопок (callback_data) -------------------------------------------
+
+Deno.test("callback: кодирование и разбор туда-обратно", () => {
+  assertEquals(encodeCallback({ action: "ok", id: "a1b2c3d4" }), "ok:a1b2c3d4");
+  assertEquals(decodeCallback("ok:a1b2c3d4"), { action: "ok", id: "a1b2c3d4" });
+  assertEquals(decodeCallback("other:a1b2c3d4"), {
+    action: "other",
+    id: "a1b2c3d4",
+  });
+});
+
+Deno.test("callback: удаление хранит uuid и укладывается в лимит Telegram (64 байта)", () => {
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  const data = encodeCallback({ action: "del", id: uuid });
+  assertEquals(data, `del:${uuid}`);
+  assertEquals(new TextEncoder().encode(data).length <= 64, true);
+  assertEquals(decodeCallback(data), { action: "del", id: uuid });
+});
+
+Deno.test("callback: мусор и неизвестные действия → null", () => {
+  assertEquals(decodeCallback("garbage"), null);
+  assertEquals(decodeCallback("hack:123"), null);
+  assertEquals(decodeCallback("ok:"), null);
+  assertEquals(decodeCallback(""), null);
+});
+
+// --- Карточка подтверждения --------------------------------------------------
+
+Deno.test("карточка: текст и две кнопки [OK] [Другое время]", () => {
+  const card = buildConfirmCard({
+    text: "встреча",
+    remindAt: new Date("2026-10-29T08:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+  });
+  assertEquals(card.text, "Напомню <b>29.10 в 11:00</b>: встреча");
+  assertEquals(card.reply_markup.inline_keyboard, [[
+    { text: "✅ OK", callback_data: "ok:a1b2c3d4" },
+    { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
+  ]]);
+});
+
+Deno.test("карточка: текст пользователя экранируется", () => {
+  const card = buildConfirmCard({
+    text: "<script>alert(1)</script> & всё",
+    remindAt: new Date("2026-10-29T08:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+  });
+  assertEquals(card.text.includes("<script>"), false);
+  assertEquals(card.text.includes("&lt;script&gt;"), true);
+  assertEquals(card.text.includes("&amp; всё"), true);
+});
+
+Deno.test("карточка: если время перенесли на завтра, об этом сказано явно", () => {
+  const card = buildConfirmCard({
+    text: "зарядка",
+    remindAt: new Date("2026-10-29T06:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+    adjusted: "tomorrow",
+  });
+  assertEquals(
+    card.text,
+    "Это время сегодня уже прошло, поэтому предлагаю завтра.\n" +
+      "Напомню <b>29.10 в 09:00</b>: зарядка",
+  );
+});
+
+// --- Список напоминаний (/list) ----------------------------------------------
+
+Deno.test("список: пустой → понятное сообщение и без кнопок", () => {
+  const msg = buildListMessage([], TZ, NOW);
+  assertEquals(msg.text, "Напоминаний пока нет.");
+  assertEquals(msg.reply_markup, undefined);
+});
+
+Deno.test("список: нумерация, даты в поясе пользователя и кнопки 🗑 с id", () => {
+  const msg = buildListMessage(
+    [
+      { id: "id-1", text: "встреча", remind_at: "2026-10-29T08:00:00Z" },
+      {
+        id: "id-2",
+        text: "позвонить <маме>",
+        remind_at: "2026-11-03T06:00:00Z",
+      },
+    ],
+    TZ,
+    NOW,
+  );
+  assertEquals(
+    msg.text,
+    "Твои напоминания:\n1. 29.10 в 11:00 — встреча\n2. 03.11 в 09:00 — позвонить &lt;маме&gt;",
+  );
+  assertEquals(msg.reply_markup!.inline_keyboard, [[
+    { text: "🗑 1", callback_data: "del:id-1" },
+    { text: "🗑 2", callback_data: "del:id-2" },
+  ]]);
+});
+
+Deno.test("список: больше 20 штук → показываем 20 и предупреждаем", () => {
+  const many = Array.from({ length: 25 }, (_, i) => ({
+    id: `id-${i}`,
+    text: `дело ${i}`,
+    remind_at: "2026-10-29T08:00:00Z",
+  }));
+  const msg = buildListMessage(many, TZ, NOW);
+  assertEquals(msg.text.split("\n").filter((l) => /^\d+\./.test(l)).length, 20);
+  assertEquals(msg.text.includes("Показаны ближайшие 20 из 25"), true);
+  // кнопки удаления — по 5 в ряд, всего 20
+  const rows = msg.reply_markup!.inline_keyboard;
+  assertEquals(rows.flat().length, 20);
+  assertEquals(rows.every((r) => r.length <= 5), true);
+});
+
+// --- Сообщение, когда напоминание сработало ----------------------------------
+
+Deno.test("сообщение-напоминание: заголовок и текст, текст экранирован", () => {
+  assertEquals(
+    buildReminderMessage("встреча"),
+    "⏰ <b>Напоминание</b>\nвстреча",
+  );
+  assertEquals(
+    buildReminderMessage("a < b"),
+    "⏰ <b>Напоминание</b>\na &lt; b",
+  );
+});
