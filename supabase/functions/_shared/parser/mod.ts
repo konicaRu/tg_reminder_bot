@@ -15,7 +15,12 @@ import {
   zonedToUtc,
 } from "./tz.ts";
 
-export type ParseFailReason = "no_date" | "empty_text" | "repeat_unsupported";
+export type ParseFailReason =
+  | "no_date"
+  | "empty_text"
+  | "repeat_unsupported"
+  | "llm_unavailable" // Groq не ответил (сеть, лимиты, ошибка сервера)
+  | "llm_invalid"; // Groq ответил, но ответ не годится (не JSON, дата в прошлом…)
 
 export type ParseOptions = {
   now: Date; // «текущий момент» (в тестах фиксированный)

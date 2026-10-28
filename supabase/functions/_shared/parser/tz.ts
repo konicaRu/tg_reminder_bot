@@ -36,6 +36,16 @@ function offsetMs(utcMs: number, tz: string): number {
   return asIfUtc - Math.floor(utcMs / 1000) * 1000;
 }
 
+// Сдвиг пояса строкой для ISO 8601: «+03:00», «-05:00».
+export function offsetString(date: Date, tz: string): string {
+  const minutes = Math.round(offsetMs(date.getTime(), tz) / 60000);
+  const sign = minutes < 0 ? "-" : "+";
+  const abs = Math.abs(minutes);
+  const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const mm = String(abs % 60).padStart(2, "0");
+  return `${sign}${hh}:${mm}`;
+}
+
 // «11:00 по Москве 29.10» → настоящий момент времени (UTC).
 export function zonedToUtc(
   y: number,
