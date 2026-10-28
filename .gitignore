@@ -1,0 +1,19 @@
+# Секреты — никогда в git (реальные значения лежат в Supabase Secrets)
+.env
+.env.*
+!.env.example
+
+# Локальные файлы Supabase CLI
+supabase/.temp/
+supabase/.branches/
+
+# Личные настройки Claude Code (командный .claude/settings.json — коммитим)
+.claude/settings.local.json
+
+# Служебное
+.commitmsg.tmp
+.DS_Store
+node_modules/
+
+# Общий шаблон старта проектов (не относится к боту)
+project-starter.md
