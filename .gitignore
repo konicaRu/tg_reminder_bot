@@ -4,8 +4,8 @@
 !.env.example
 
 # Локальные файлы Supabase CLI
-supabase/.temp/
-supabase/.branches/
+**/supabase/.temp/
+**/supabase/.branches/
 
 # Личные настройки Claude Code (командный .claude/settings.json — коммитим)
 .claude/settings.local.json
