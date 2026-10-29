@@ -136,6 +136,7 @@ function failureMessage(reason: ParseFailReason): string {
 // --- Состояния диалога (поле state в таблице sessions) ------------------------
 const CONFIRM = "confirm"; // показали карточку, ждём «OK»
 const AWAITING_TIME = "awaiting_time"; // нажали «Другое время», ждём новое время текстом
+const DRAFT_TEXT = "draft_text"; // нажали «✏️ Текст» на карточке (до OK), ждём новый текст
 const EDIT_TEXT = "edit_text"; // нажали «✏️ Текст» в меню правки, ждём новый текст
 const EDIT_TIME = "edit_time"; // нажали «🕐 Время» в меню правки, ждём новое время
 
@@ -298,6 +299,21 @@ export function createHandlers(deps: Deps) {
     async text(io: Io, input: string): Promise<void> {
       const opts = await parseOptions(io.chatId);
       const session = await store.getSession(io.chatId);
+      if (session?.state === DRAFT_TEXT) {
+        const text = input.trim();
+        if (!text) {
+          return io.reply("Текст не может быть пустым. Напиши ещё раз.");
+        }
+        // Новый черновик с новым кодом: кнопки прежней карточки устаревают.
+        const draft: Draft = {
+          ...(session.payload as Draft),
+          id: deps.newId(),
+          text,
+        };
+        await store.setSession(io.chatId, CONFIRM, draft);
+        const card = cardFor(draft, opts);
+        return io.reply(card.text, card.reply_markup);
+      }
       if (session?.state === EDIT_TEXT || session?.state === EDIT_TIME) {
         return onEdit(io, session.state, session.payload, input);
       }
@@ -384,7 +400,7 @@ export function createHandlers(deps: Deps) {
         const settings = await store.getSettings(io.chatId);
         const remindAt = new Date(draft.remind_at);
         const nag = draft.nag ?? null;
-        await store.createReminder({
+        const created = await store.createReminder({
           chat_id: io.chatId,
           text: draft.text,
           remind_at: remindAt,
@@ -396,6 +412,13 @@ export function createHandlers(deps: Deps) {
         await io.edit(
           `✅ Готово! Напомню <b>${when}</b>: ${escapeHtml(draft.text)}` +
             (nag ? `\n🔁 Повторю ${describeNag(nag)}` : ""),
+          // Кнопка «Изменить» остаётся: ошибку можно поправить и после «OK».
+          {
+            inline_keyboard: [[{
+              text: "✏️ Изменить",
+              callback_data: encodeCallback({ action: "edit", id: created.id }),
+            }]],
+          },
         );
         return io.answer();
       }
@@ -421,6 +444,17 @@ export function createHandlers(deps: Deps) {
         await store.setSession(io.chatId, CONFIRM, updated);
         const card = cardFor(updated, await parseOptions(io.chatId));
         await io.edit(card.text, card.reply_markup);
+        return io.answer();
+      }
+
+      // «✏️ Текст» на карточке (до «OK»): ждём новый текст, время и повтор остаются.
+      if (c.action === "dtxt") {
+        await store.setSession(io.chatId, DRAFT_TEXT, draft);
+        await io.edit(
+          `Новый текст для: «${
+            escapeHtml(draft.text)
+          }»\nНапиши его одним сообщением.`,
+        );
         return io.answer();
       }
 

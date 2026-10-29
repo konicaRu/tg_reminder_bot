@@ -24,6 +24,7 @@ export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 //   edit  — открыть меню правки напоминания из /list
 //   etxt  — править текст     etime — править время
 //   list  — вернуться к списку
+//   dtxt  — править текст на карточке подтверждения (до «OK»)
 export type CallbackAction =
   | "ok"
   | "other"
@@ -35,7 +36,8 @@ export type CallbackAction =
   | "edit"
   | "etxt"
   | "etime"
-  | "list";
+  | "list"
+  | "dtxt";
 
 // «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
 // (считая первое), пока пользователь не нажмёт «Готово».
@@ -122,9 +124,10 @@ export function decodeCallback(
   data: string,
 ): { action: CallbackAction; id: string; arg?: number } | null {
   const plain =
-    /^(ok|other|del|done|rep|edit|etxt|etime|list):([A-Za-z0-9_-]{1,60})$/.exec(
-      data,
-    );
+    /^(ok|other|del|done|rep|edit|etxt|etime|list|dtxt):([A-Za-z0-9_-]{1,60})$/
+      .exec(
+        data,
+      );
   if (plain) return { action: plain[1] as CallbackAction, id: plain[2] };
   const withArg = /^(ivl|cnt):([A-Za-z0-9_-]{1,50}):(\d{1,4})$/.exec(data);
   if (withArg) {
@@ -165,11 +168,17 @@ export function buildConfirmCard(a: {
   ]];
 
   if (!a.nag) {
-    rows.push([{ text: "🔁 Повторять", callback_data: cb("rep") }]);
+    rows.push([
+      { text: "🔁 Повторять", callback_data: cb("rep") },
+      { text: "✏️ Текст", callback_data: cb("dtxt") },
+    ]);
   } else {
     const nag = a.nag;
     text += `\n🔁 Повторю ${describeNag(nag)}, пока не нажмёшь «Готово»`;
-    rows.push([{ text: "🔁 Выключить повтор", callback_data: cb("rep") }]);
+    rows.push([
+      { text: "🔁 Выключить повтор", callback_data: cb("rep") },
+      { text: "✏️ Текст", callback_data: cb("dtxt") },
+    ]);
     // Отметка ✓ стоит у выбранного значения.
     rows.push(NAG_INTERVALS.map((m) => ({
       text: `${formatInterval(m)}${m === nag.intervalMin ? " ✓" : ""}`,

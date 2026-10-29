@@ -286,7 +286,12 @@ Deno.test("OK: сохраняем напоминание, чистим черн�
 
   const edit = t.sent.find((s) => s.kind === "edit")!;
   assertEquals(edit.text, "✅ Готово! Напомню <b>28.10 в 12:03</b>: проверка");
-  assertEquals(edit.markup, undefined); // кнопки убраны
+  // остаётся единственная кнопка «Изменить»
+  assertEquals(
+    (edit.markup as { inline_keyboard: unknown[][] }).inline_keyboard.flat()
+      .length,
+    1,
+  );
   assertEquals(t.sent.some((s) => s.kind === "answer"), true); // кнопка перестала «крутиться»
 });
 
@@ -707,5 +712,60 @@ Deno.test("правка: «К списку» возвращает список",
   assertEquals(
     t.sent.filter((s) => s.kind === "edit").at(-1)!.text,
     "Твои напоминания:\n1. 29.10 в 11:00 — встреча",
+  );
+});
+
+// --- Правка до и после «OK» --------------------------------------------------
+
+Deno.test("до OK: «✏️ Текст» на карточке меняет текст, время и повтор сохраняются", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  assertEquals(t.sessions.get(CHAT)?.state, "draft_text");
+  await t.h.text(t.io, "встреча с <Петей>");
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(
+    card.text!.startsWith(
+      "Напомню <b>29.10 в 11:00</b>: встреча с &lt;Петей&gt;",
+    ),
+    true,
+  );
+  assertEquals(card.text!.includes("🔁 Повторю"), true);
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].text, "встреча с <Петей>");
+  assertEquals(t.reminders[0].nag_total, 10);
+});
+
+Deno.test("до OK: пустой текст не принимаем, старая карточка после правки устаревает", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  const oldOk = buttonData(t.sent, "OK");
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  await t.h.text(t.io, "   ");
+  assertEquals(t.sessions.get(CHAT)?.state, "draft_text");
+  await t.h.text(t.io, "новый");
+  await t.h.callback(t.io, oldOk); // кнопка старой карточки
+  assertEquals(t.reminders.length, 0);
+});
+
+Deno.test("до OK: «✏️ Текст» на устаревшей карточке → «устарела»", async () => {
+  const t = setup();
+  await t.h.callback(t.io, "dtxt:zzzz");
+  assertEquals(
+    t.sent.some((s) => s.kind === "answer" && s.text?.includes("устарела")),
+    true,
+  );
+});
+
+Deno.test("после OK: под «Готово!» есть «✏️ Изменить» и она открывает меню правки", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(buttonData(t.sent, "Изменить"), "edit:rem-1");
+  await t.h.callback(t.io, buttonData(t.sent, "Изменить"));
+  assertEquals(
+    t.sent.filter((s) => s.kind === "edit").at(-1)!.text,
+    "Что изменить?\n29.10 в 11:00 — встреча",
   );
 });

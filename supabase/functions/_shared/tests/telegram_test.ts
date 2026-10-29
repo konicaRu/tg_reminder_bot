@@ -111,7 +111,10 @@ Deno.test("карточка: текст и две кнопки [OK] [Друго�
       { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
     ],
     // второй ряд: включить повторные напоминания
-    [{ text: "🔁 Повторять", callback_data: "rep:a1b2c3d4" }],
+    [
+      { text: "🔁 Повторять", callback_data: "rep:a1b2c3d4" },
+      { text: "✏️ Текст", callback_data: "dtxt:a1b2c3d4" },
+    ],
   ]);
 });
 
@@ -284,7 +287,10 @@ Deno.test("карточка с повтором: кнопки OK/Другое в
       { text: "✅ OK", callback_data: "ok:a1b2c3d4" },
       { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
     ],
-    [{ text: "🔁 Выключить повтор", callback_data: "rep:a1b2c3d4" }],
+    [
+      { text: "🔁 Выключить повтор", callback_data: "rep:a1b2c3d4" },
+      { text: "✏️ Текст", callback_data: "dtxt:a1b2c3d4" },
+    ],
     [
       { text: "5 мин ✓", callback_data: "ivl:a1b2c3d4:5" },
       { text: "10 мин", callback_data: "ivl:a1b2c3d4:10" },
@@ -421,6 +427,7 @@ Deno.test("callback: новые действия edit / etxt / etime / list ра
   assertEquals(decodeCallback("edit:abc-1"), { action: "edit", id: "abc-1" });
   assertEquals(decodeCallback("etxt:abc-1"), { action: "etxt", id: "abc-1" });
   assertEquals(decodeCallback("etime:abc-1"), { action: "etime", id: "abc-1" });
+  assertEquals(decodeCallback("dtxt:a1b2"), { action: "dtxt", id: "a1b2" });
   assertEquals(decodeCallback("list:all"), { action: "list", id: "all" });
   assertEquals(decodeCallback("edit:"), null);
   assertEquals(decodeCallback("edit:a b"), null);
