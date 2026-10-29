@@ -106,6 +106,15 @@ export function parseAllowedId(raw: string | undefined): number {
   return n;
 }
 
+// Подсказка при правке текста. Telegram не умеет подставить старый текст в поле ввода,
+// поэтому показываем его в <code>: нажатие на такой текст копирует его целиком,
+// остаётся вставить в поле и поправить.
+function textPrompt(oldText: string): string {
+  return `Текущий текст (нажми на него, чтобы скопировать):\n<code>${
+    escapeHtml(oldText)
+  }</code>\n\nВставь, поправь и отправь одним сообщением.`;
+}
+
 // --- Тексты бота (коротко, по-русски) ----------------------------------------
 
 const MSG = {
@@ -370,9 +379,7 @@ export function createHandlers(deps: Deps) {
         });
         await io.edit(
           isText
-            ? `Новый текст для: «${
-              escapeHtml(r.text)
-            }»\nНапиши его одним сообщением.`
+            ? textPrompt(r.text)
             : `Новое время для: «${escapeHtml(r.text)}»\n` +
               "Напиши, например, «завтра в 12» или «через час». " +
               "Можно сразу и новый текст: «завтра в 12 созвон».",
@@ -450,11 +457,7 @@ export function createHandlers(deps: Deps) {
       // «✏️ Текст» на карточке (до «OK»): ждём новый текст, время и повтор остаются.
       if (c.action === "dtxt") {
         await store.setSession(io.chatId, DRAFT_TEXT, draft);
-        await io.edit(
-          `Новый текст для: «${
-            escapeHtml(draft.text)
-          }»\nНапиши его одним сообщением.`,
-        );
+        await io.edit(textPrompt(draft.text));
         return io.answer();
       }
 

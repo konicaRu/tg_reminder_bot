@@ -769,3 +769,11 @@ Deno.test("после OK: под «Готово!» есть «✏️ Измен�
     "Что изменить?\n29.10 в 11:00 — встреча",
   );
 });
+
+Deno.test("правка текста: подсказка показывает старый текст в <code> (копируется нажатием), экранированный", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча <Петя>");
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  const prompt = t.sent.filter((s) => s.kind === "edit").at(-1)!.text!;
+  assertEquals(prompt.includes("<code>встреча &lt;Петя&gt;</code>"), true);
+});
