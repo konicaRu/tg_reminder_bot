@@ -99,3 +99,49 @@ export async function clearInlineKeyboard(
     fetchFn,
   );
 }
+
+// Скачивает файл из Telegram (например, голосовое) и возвращает его байты.
+// Два шага: getFile («где лежит файл») → загрузка по адресу с токеном. Как и везде здесь,
+// тексты ошибок не содержат токен: адрес с ним есть в исходных ошибках сети.
+// maxBytes — защита от огромных файлов: проверяем и заявленный размер, и реально полученный.
+export async function downloadTelegramFile(
+  token: string,
+  fileId: string,
+  opts: { maxBytes: number },
+  fetchFn: typeof fetch = fetch,
+): Promise<Uint8Array> {
+  const tooBig = () => new Error("Telegram: файл слишком большой");
+  const info =
+    (await callTelegramApi(token, "getFile", { file_id: fileId }, fetchFn)) as
+      | { file_path?: string; file_size?: number }
+      | undefined;
+  if (!info?.file_path) throw new Error("Telegram: в ответе нет file_path");
+  if (typeof info.file_size === "number" && info.file_size > opts.maxBytes) {
+    throw tooBig();
+  }
+
+  let response: Response;
+  try {
+    response = await fetchFn(
+      `https://api.telegram.org/file/bot${token}/${info.file_path}`,
+      { signal: AbortSignal.timeout(TIMEOUT_MS) },
+    );
+  } catch {
+    throw new Error(
+      "Telegram: не удалось скачать файл (сеть или время ожидания)",
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Telegram: скачивание файла не удалось (HTTP ${response.status})`,
+    );
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(await response.arrayBuffer());
+  } catch {
+    throw new Error("Telegram: файл скачался не полностью");
+  }
+  if (bytes.length > opts.maxBytes) throw tooBig();
+  return bytes;
+}

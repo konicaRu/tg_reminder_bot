@@ -24,7 +24,18 @@ type Sent = {
 };
 
 // «Двойник» окружения: хранилище в памяти + журнал того, что бот отправил в Telegram.
-function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
+type Stt = { ok: true; text: string } | {
+  ok: false;
+  reason: "stt_empty" | "unavailable";
+};
+
+function setup(
+  opts: {
+    llm?: (input: string) => Promise<ParseResult>;
+    transcribe?: (fileId: string) => Promise<Stt>;
+  } = {},
+) {
+  const transcribed: string[] = []; // для каких файлов запускали распознавание
   const sessions = new Map<number, Session>();
   const reminders: Reminder[] = [];
   const sent: Sent[] = [];
@@ -158,11 +169,25 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
         return opts.llm!(input);
       }
       : undefined,
+    transcribe: opts.transcribe
+      ? (fileId) => {
+        transcribed.push(fileId);
+        return opts.transcribe!(fileId);
+      }
+      : undefined,
     now: () => NOW,
     newId: () => `draft${++idCounter}`,
   });
 
-  return { h, io, sessions, reminders, sent, llmCalls: () => llmCalls };
+  return {
+    h,
+    io,
+    sessions,
+    reminders,
+    sent,
+    transcribed,
+    llmCalls: () => llmCalls,
+  };
 }
 
 const llmFails = () =>
@@ -472,12 +497,12 @@ Deno.test("удаление уже удалённого → «Уже удале�
 
 // --- Не текст ----------------------------------------------------------------
 
-Deno.test("фото/голос/файл: пока понимаем только текст", async () => {
+Deno.test("фото/файл/стикер: пока понимаем только текст и голосовые", async () => {
   const t = setup();
   await t.h.unsupported(t.io);
   assertEquals(
     t.sent[0].text,
-    "Пока понимаю только текст. Напиши, например: «завтра в 11 встреча».",
+    "Пока понимаю только текст и голосовые. Напиши, например: «завтра в 11 встреча».",
   );
 });
 
@@ -976,4 +1001,99 @@ Deno.test("расписание: «Другое время» на карточк
   await t.h.text(t.io, "завтра в 12");
   await t.h.callback(t.io, buttonData(t.sent, "OK"));
   assertEquals(t.reminders[0].rrule, null);
+});
+
+// --- Голосовые ---------------------------------------------------------------
+
+const heard = (text: string) => () =>
+  Promise.resolve({ ok: true, text } as Stt);
+
+Deno.test("голос: распознали → карточка с «🎙 Я услышал», в базу ничего не пишем", async () => {
+  const t = setup({ transcribe: heard("завтра в 11 встреча") });
+  await t.h.voice(t.io, { fileId: "F1", duration: 5 });
+  assertEquals(t.transcribed, ["F1"]);
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(
+    card.text,
+    "🎙 Я услышал: «завтра в 11 встреча»\nНапомню <b>29.10 в 11:00</b>: встреча",
+  );
+  assertEquals(t.reminders.length, 0);
+  buttonData(t.sent, "OK"); // кнопки на месте
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].text, "встреча");
+});
+
+Deno.test("голос: расписание тоже работает («каждый день в 9 зарядка»)", async () => {
+  const t = setup({ transcribe: heard("каждый день в 9 зарядка") });
+  await t.h.voice(t.io, { fileId: "F1", duration: 5 });
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text!.includes(
+      "📆 Повторяется каждый день в 09:00",
+    ),
+    true,
+  );
+});
+
+Deno.test("голос: длиннее минуты → просим покороче, распознавание не запускаем", async () => {
+  const t = setup({ transcribe: heard("не должно вызываться") });
+  await t.h.voice(t.io, { fileId: "F1", duration: 61 });
+  assertEquals(t.transcribed, []);
+  assertEquals(t.sent.at(-1)!.text!.includes("длиннее минуты"), true);
+  assertEquals(t.reminders.length, 0);
+});
+
+Deno.test("голос: Groq недоступен → понятная фраза, без записи в базу и без сессии", async () => {
+  const t = setup({
+    transcribe: () =>
+      Promise.resolve({ ok: false, reason: "unavailable" } as Stt),
+  });
+  await t.h.voice(t.io, { fileId: "F1", duration: 5 });
+  assertEquals(
+    t.sent.at(-1)!.text!.includes("Не удалось разобрать голосовое"),
+    true,
+  );
+  assertEquals(t.reminders.length, 0);
+  assertEquals(t.sessions.size, 0);
+});
+
+Deno.test("голос: тишина/пусто → «не расслышал»", async () => {
+  const t = setup({
+    transcribe: () =>
+      Promise.resolve({ ok: false, reason: "stt_empty" } as Stt),
+  });
+  await t.h.voice(t.io, { fileId: "F1", duration: 5 });
+  assertEquals(t.sent.at(-1)!.text!.includes("Не расслышал"), true);
+});
+
+Deno.test("голос: распознали, но даты нет → обычный ответ «не понял, когда», с услышанным текстом", async () => {
+  const t = setup({ transcribe: heard("купить молоко") });
+  await t.h.voice(t.io, { fileId: "F1", duration: 5 });
+  const text = t.sent.at(-1)!.text!;
+  assertEquals(text.includes("Не понял, когда напомнить"), true);
+  assertEquals(text.includes("купить молоко"), true); // человек видит, что именно услышал бот
+});
+
+Deno.test("голос: ответ на «🕐 Другое время» голосом работает как текст", async () => {
+  const t = setup({ transcribe: heard("завтра в 12") });
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "Другое время"));
+  await t.h.voice(t.io, { fileId: "F1", duration: 3 });
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(card.text!.includes("29.10 в 12:00"), true);
+  assertEquals(card.text!.includes("встреча"), true);
+});
+
+Deno.test("голос: не настроено распознавание → честно говорим, что голос недоступен", async () => {
+  const t = setup();
+  await t.h.voice(t.io, { fileId: "F1", duration: 3 });
+  assertEquals(t.sent.at(-1)!.text!.includes("Голос сейчас недоступен"), true);
+});
+
+Deno.test("голос: исключение из распознавания не роняет бота", async () => {
+  const t = setup({ transcribe: () => Promise.reject(new Error("boom")) });
+  await t.h.voice(t.io, { fileId: "F1", duration: 3 });
+  assertEquals(
+    t.sent.at(-1)!.text!.includes("Не удалось разобрать голосовое"),
+    true,
+  );
 });

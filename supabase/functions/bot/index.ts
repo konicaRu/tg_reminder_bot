@@ -26,7 +26,8 @@ import {
   stopReminder,
   updateReminder,
 } from "../_shared/db.ts";
-import { parseWithLlm } from "../_shared/groq.ts";
+import { parseWithLlm, transcribeAudio } from "../_shared/groq.ts";
+import { downloadTelegramFile } from "../_shared/telegram_api.ts";
 import { parseReminder } from "../_shared/parser/mod.ts";
 import {
   createHandlers,
@@ -34,6 +35,7 @@ import {
   isAllowed,
   parseAllowedIds,
   type Store,
+  type Transcription,
 } from "./handlers.ts";
 
 // --- Секреты (лежат в Supabase Secrets, в коде их нет) ------------------------
@@ -51,6 +53,9 @@ const allowedUserIds = parseAllowedIds(Deno.env.get("ALLOWED_USER_ID"));
 // Groq необязателен: нет ключа или модели → бот работает только на правилах.
 const groqKey = Deno.env.get("GROQ_API_KEY");
 const groqModel = Deno.env.get("GROQ_LLM_MODEL");
+// Модель распознавания голоса: по умолчанию whisper-large-v3, можно сменить без правки кода.
+const sttModel = Deno.env.get("GROQ_STT_MODEL") ?? "whisper-large-v3";
+const MAX_VOICE_BYTES = 5 * 1024 * 1024; // голосовое на минуту весит ~100–300 КБ
 
 // --- Подключаем «мозг» к настоящей базе и парсеру -----------------------------
 const db = createDb();
@@ -71,8 +76,40 @@ const store: Store = {
   updateReminder: (chatId, id, patch) => updateReminder(db, chatId, id, patch),
 };
 
+// Голос: скачать файл из Telegram → отправить в Whisper. Любую неудачу сводим к «unavailable»:
+// подробности (в них может быть личное) наружу не выходят. Нет ключа Groq → голос выключен.
+const transcribe = groqKey
+  ? async (fileId: string): Promise<Transcription> => {
+    try {
+      const audio = await downloadTelegramFile(token, fileId, {
+        maxBytes: MAX_VOICE_BYTES,
+      });
+      const res = await transcribeAudio(audio, {
+        apiKey: groqKey,
+        model: sttModel,
+      });
+      if (res.ok) return res;
+      if (res.reason === "stt_unavailable") {
+        console.error("Распознавание голоса: Groq недоступен");
+      }
+      return {
+        ok: false,
+        reason: res.reason === "stt_empty" ? "stt_empty" : "unavailable",
+      };
+    } catch (err) {
+      // тексты ошибок скачивания не содержат токен (см. telegram_api.ts)
+      console.error(
+        "Распознавание голоса не удалось:",
+        err instanceof Error ? err.message : "ошибка",
+      );
+      return { ok: false, reason: "unavailable" };
+    }
+  }
+  : undefined;
+
 const handlers = createHandlers({
   store,
+  transcribe,
   parse: parseReminder,
   llm: groqKey && groqModel
     ? (input, opts) =>
@@ -135,7 +172,15 @@ bot.on(
   (ctx) => handlers.callback(ioFor(ctx), ctx.callbackQuery.data),
 );
 bot.on("message:text", (ctx) => handlers.text(ioFor(ctx), ctx.message.text));
-bot.on("message", (ctx) => handlers.unsupported(ioFor(ctx))); // фото, голос, файлы…
+bot.on(
+  "message:voice",
+  (ctx) =>
+    handlers.voice(ioFor(ctx), {
+      fileId: ctx.message.voice.file_id,
+      duration: ctx.message.voice.duration,
+    }),
+);
+bot.on("message", (ctx) => handlers.unsupported(ioFor(ctx))); // фото, файлы, стикеры…
 
 // Если что-то сломалось, логируем и отвечаем Telegram «ок». Иначе Telegram решит, что запрос
 // не дошёл, и будет присылать то же сообщение снова и снова. В лог пишем только текст ошибки.

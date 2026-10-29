@@ -28,6 +28,7 @@ import {
   encodeCallback,
   escapeHtml,
   formatWhen,
+  heardLine,
   type InlineKeyboardMarkup,
   type Nag,
   NAG_COUNTS,
@@ -97,10 +98,20 @@ export type Io = {
   answer(text?: string): Promise<void>;
 };
 
+// Результат распознавания голоса (его делает index.ts: скачать из Telegram → Whisper).
+export type Transcription =
+  | { ok: true; text: string }
+  | { ok: false; reason: "stt_empty" | "unavailable" };
+
+// Дольше этого голосовое не распознаём: бесплатные лимиты Groq общие, а напоминания короткие.
+export const MAX_VOICE_SECONDS = 60;
+
 export type Deps = {
   store: Store;
   parse: (input: string, opts: ParseOptions) => ParseResult; // правила
   llm?: (input: string, opts: ParseOptions) => Promise<ParseResult>; // Groq, может не быть
+  // Распознать голосовое по file_id; нет функции = голос не настроен (нет ключа Groq)
+  transcribe?: (fileId: string) => Promise<Transcription>;
   now: () => Date;
   newId: () => string; // короткий код черновика
 };
@@ -163,11 +174,15 @@ const MSG = {
   repeat:
     "Такие повторы пока умею только: каждый день, по будням, по выходным " +
     "и по дням недели.\nНапример: «каждый будний день в 9 зарядка».",
+  voiceOff: "Голос сейчас недоступен, напиши текстом.",
+  voiceLong: "Голосовое длиннее минуты. Запиши покороче или напиши текстом.",
+  voiceFail: "Не удалось разобрать голосовое, напиши текстом.",
+  voiceEmpty: "Не расслышал. Повтори ещё раз или напиши текстом.",
   editGone: "Уже сработало или удалено",
   editTooLate: "Это напоминание уже сработало или удалено, изменить нельзя.",
   stale: "Эта карточка устарела. Напиши напоминание заново.",
   unsupported:
-    "Пока понимаю только текст. Напиши, например: «завтра в 11 встреча».",
+    "Пока понимаю только текст и голосовые. Напиши, например: «завтра в 11 встреча».",
 } as const;
 
 // Какое сообщение показать, если разобрать фразу не удалось.
@@ -208,7 +223,7 @@ export function createHandlers(deps: Deps) {
   }
 
   // Карточка по черновику (общая для первого показа и для обновления после нажатий).
-  function cardFor(draft: Draft, opts: ParseOptions) {
+  function cardFor(draft: Draft, opts: ParseOptions, heard?: string) {
     return buildConfirmCard({
       text: draft.text,
       remindAt: new Date(draft.remind_at),
@@ -218,6 +233,7 @@ export function createHandlers(deps: Deps) {
       adjusted: draft.adjusted ?? undefined,
       nag: draft.nag,
       rrule: draft.rrule,
+      heard,
     });
   }
 
@@ -228,6 +244,7 @@ export function createHandlers(deps: Deps) {
     res: Extract<ParseResult, { ok: true }>,
     opts: ParseOptions,
     nag: Nag | null = null,
+    heard?: string, // распознанный голос: показываем на новой карточке
   ): Promise<void> {
     const draft: Draft = {
       id: deps.newId(),
@@ -238,7 +255,7 @@ export function createHandlers(deps: Deps) {
       rrule: res.rrule,
     };
     await store.setSession(io.chatId, CONFIRM, draft);
-    const card = cardFor(draft, opts);
+    const card = cardFor(draft, opts, heard);
     await io.reply(card.text, card.reply_markup);
   }
 
@@ -346,7 +363,8 @@ export function createHandlers(deps: Deps) {
     },
 
     // Обычное текстовое сообщение.
-    async text(io: Io, input: string): Promise<void> {
+    // heard — этот текст на самом деле распознан из голосового (показываем «🎙 Я услышал»).
+    async text(io: Io, input: string, heard?: string): Promise<void> {
       const opts = await parseOptions(io.chatId);
       const session = await store.getSession(io.chatId);
       if (session?.state === DRAFT_TEXT) {
@@ -376,8 +394,34 @@ export function createHandlers(deps: Deps) {
       if (!res.ok && res.reason === "no_date" && deps.llm) {
         res = await deps.llm(input, opts);
       }
-      if (!res.ok) return io.reply(failureMessage(res.reason));
-      return showCard(io, res, opts);
+      if (!res.ok) {
+        // Для голоса показываем, что именно услышал бот: так видно, ошибся ли Whisper.
+        const prefix = heard !== undefined ? heardLine(heard) : "";
+        return io.reply(prefix + failureMessage(res.reason));
+      }
+      return showCard(io, res, opts, null, heard);
+    },
+
+    // Голосовое сообщение: распознаём и дальше ведём как обычный текст.
+    async voice(
+      io: Io,
+      v: { fileId: string; duration: number },
+    ): Promise<void> {
+      if (!deps.transcribe) return io.reply(MSG.voiceOff);
+      if (v.duration > MAX_VOICE_SECONDS) return io.reply(MSG.voiceLong);
+      let stt: Transcription;
+      try {
+        stt = await deps.transcribe(v.fileId);
+      } catch {
+        // Подробности не пишем: в них может быть адрес с токеном или личные данные.
+        return io.reply(MSG.voiceFail);
+      }
+      if (!stt.ok) {
+        return io.reply(
+          stt.reason === "stt_empty" ? MSG.voiceEmpty : MSG.voiceFail,
+        );
+      }
+      return this.text(io, stt.text, stt.text);
     },
 
     // Нажатие на inline-кнопку. data — то, что мы записали в callback_data.

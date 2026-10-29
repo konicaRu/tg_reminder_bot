@@ -157,3 +157,65 @@ export async function parseWithLlm(
 
   return { ok: true, text: cleanText, remindAt, rrule: null, confidence };
 }
+
+// --- Распознавание голоса (Whisper) ------------------------------------------
+
+const GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+const STT_TIMEOUT_MS = 20_000;
+
+export type SttConfig = {
+  apiKey: string;
+  model: string; // например, whisper-large-v3
+  fetchFn?: typeof fetch; // для тестов
+};
+
+export type SttResult =
+  | { ok: true; text: string }
+  // stt_unavailable: Groq не ответил (сеть, лимиты, ошибка сервера);
+  // stt_empty: ответ пришёл, но слов в нём нет (тишина, шум)
+  | { ok: false; reason: "stt_unavailable" | "stt_empty" };
+
+// Голосовые сообщения Telegram — это OGG/Opus; Groq принимает такой формат как есть.
+// Содержимое (аудио и распознанный текст) нигде не логируем: оно личное.
+export async function transcribeAudio(
+  audio: Uint8Array,
+  cfg: SttConfig,
+): Promise<SttResult> {
+  const fetchFn = cfg.fetchFn ?? fetch;
+  const form = new FormData();
+  form.append(
+    "file",
+    new File([audio.slice().buffer as ArrayBuffer], "voice.ogg", {
+      type: "audio/ogg",
+    }),
+  );
+  form.append("model", cfg.model);
+  form.append("language", "ru");
+  form.append("temperature", "0");
+  form.append("response_format", "json");
+
+  let response: Response;
+  try {
+    response = await fetchFn(GROQ_STT_URL, {
+      method: "POST",
+      // Content-Type не задаём: fetch сам добавит его вместе с границей multipart
+      headers: { "Authorization": `Bearer ${cfg.apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+    });
+  } catch {
+    return { ok: false, reason: "stt_unavailable" };
+  }
+  if (!response.ok) return { ok: false, reason: "stt_unavailable" };
+
+  let text: unknown;
+  try {
+    text = (await response.json())?.text;
+  } catch {
+    return { ok: false, reason: "stt_unavailable" };
+  }
+  if (typeof text !== "string" || !text.trim()) {
+    return { ok: false, reason: "stt_empty" };
+  }
+  return { ok: true, text: text.trim() };
+}

@@ -246,3 +246,73 @@ Deno.test("Groq: обычная модель → параметра reasoning_ef
   assertEquals("reasoning_effort" in body, false);
   assertEquals(body.max_tokens >= 1000, true);
 });
+
+// --- Распознавание голоса (Whisper) ------------------------------------------
+
+import { transcribeAudio } from "../groq.ts";
+
+function fakeWhisper(body: unknown, status = 200) {
+  const calls: Captured[] = [];
+  const fetchFn = ((url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return Promise.resolve(new Response(JSON.stringify(body), { status }));
+  }) as typeof fetch;
+  return { fetchFn, calls };
+}
+const AUDIO = new Uint8Array([79, 103, 103, 83]); // «OggS»
+const stt = (fetchFn: typeof fetch) => ({
+  apiKey: "gsk_test",
+  model: "whisper-large-v3",
+  fetchFn,
+});
+
+Deno.test("Whisper: успех → текст без лишних пробелов; запрос — multipart с моделью и языком ru", async () => {
+  const { fetchFn, calls } = fakeWhisper({ text: "  завтра в 11 встреча  " });
+  const res = await transcribeAudio(AUDIO, stt(fetchFn));
+  assertEquals(res, { ok: true, text: "завтра в 11 встреча" });
+  assertEquals(calls.length, 1);
+  assertEquals(
+    calls[0].url,
+    "https://api.groq.com/openai/v1/audio/transcriptions",
+  );
+  const headers = calls[0].init.headers as Record<string, string>;
+  assertEquals(headers["Authorization"], "Bearer gsk_test");
+  // Content-Type с границей multipart ставит fetch сам: вручную его задавать нельзя
+  assertEquals(headers["Content-Type"], undefined);
+  const form = calls[0].init.body as FormData;
+  assertEquals(form.get("model"), "whisper-large-v3");
+  assertEquals(form.get("language"), "ru");
+  assertEquals(form.get("temperature"), "0");
+  assertEquals(form.get("response_format"), "json");
+  const file = form.get("file") as File;
+  assertEquals(file.name.endsWith(".ogg"), true);
+  assertEquals(file.size, AUDIO.length);
+});
+
+Deno.test("Whisper: пустой текст или тишина → stt_empty", async () => {
+  for (const body of [{ text: "" }, { text: "   " }, {}, { text: 5 }]) {
+    const { fetchFn } = fakeWhisper(body);
+    assertEquals(await transcribeAudio(AUDIO, stt(fetchFn)), {
+      ok: false,
+      reason: "stt_empty",
+    });
+  }
+});
+
+Deno.test("Whisper: HTTP 429 / 500 / 400 → stt_unavailable", async () => {
+  for (const status of [429, 500, 400]) {
+    const { fetchFn } = fakeWhisper({ error: { message: "boom" } }, status);
+    assertEquals(await transcribeAudio(AUDIO, stt(fetchFn)), {
+      ok: false,
+      reason: "stt_unavailable",
+    });
+  }
+});
+
+Deno.test("Whisper: сеть упала → stt_unavailable", async () => {
+  const fetchFn = (() => Promise.reject(new Error("network"))) as typeof fetch;
+  assertEquals(await transcribeAudio(AUDIO, stt(fetchFn)), {
+    ok: false,
+    reason: "stt_unavailable",
+  });
+});

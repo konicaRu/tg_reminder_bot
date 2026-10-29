@@ -146,6 +146,11 @@ export function decodeCallback(
   return null;
 }
 
+// «🎙 Я услышал: «…»» с переводом строки: что распознал бот в голосовом (экранировано).
+export function heardLine(heard: string): string {
+  return `🎙 Я услышал: «${escapeHtml(heard)}»\n`;
+}
+
 // --- Карточка подтверждения --------------------------------------------------
 // Ничего не сохраняется в базу, пока пользователь не нажмёт «✅ OK»: так ошибка разбора даты
 // не превращается в пропущенную встречу. draftId — короткий код черновика: нужен, чтобы кнопки
@@ -160,6 +165,7 @@ export function buildConfirmCard(a: {
   adjusted?: "tomorrow";
   nag?: Nag | null;
   rrule?: string | null; // расписание повторов, если есть
+  heard?: string; // распознанный текст голосового: показываем первой строкой
 }): { text: string; reply_markup: InlineKeyboardMarkup } {
   const when = formatWhen(a.remindAt, a.timezone, a.now);
   const note = a.adjusted === "tomorrow"
@@ -168,7 +174,8 @@ export function buildConfirmCard(a: {
   const cb = (action: CallbackAction, arg?: number) =>
     encodeCallback({ action, id: a.draftId, arg });
 
-  let text = `${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`;
+  const heard = a.heard !== undefined ? heardLine(a.heard) : "";
+  let text = `${heard}${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`;
   if (a.rrule) text += `\n📆 Повторяется ${describeRrule(a.rrule)}`;
   const rows: InlineButton[][] = [[
     { text: "✅ OK", callback_data: cb("ok") },

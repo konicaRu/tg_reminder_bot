@@ -6,6 +6,7 @@ import { deepStrictEqual as assertEquals } from "node:assert";
 import {
   callTelegramApi,
   clearInlineKeyboard,
+  downloadTelegramFile,
   sendTelegramMessage,
 } from "../telegram_api.ts";
 
@@ -176,4 +177,109 @@ Deno.test("clearInlineKeyboard: ошибка Telegram → исключение �
   const err = await errorOf(clearInlineKeyboard(TOKEN, 555, 42, fetchFn));
   assertEquals(err.message.includes("message to edit not found"), true);
   assertEquals(err.message.includes("SECRET-TOKEN-VALUE"), false);
+});
+
+// --- Скачивание файла (голосовые) --------------------------------------------
+
+// Фальшивый Telegram: getFile отвечает JSON, скачивание файла отдаёт байты.
+function fakeFiles(o: {
+  fileSize?: number;
+  filePath?: string;
+  bytes?: Uint8Array;
+  getFileStatus?: number;
+  downloadThrows?: boolean;
+}) {
+  const calls: { url: string; init?: RequestInit }[] = [];
+  const fetchFn = ((url: string, init?: RequestInit) => {
+    calls.push({ url, init });
+    if (url.endsWith("/getFile")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify(
+            o.getFileStatus && o.getFileStatus !== 200
+              ? { ok: false, error_code: o.getFileStatus, description: "bad" }
+              : {
+                ok: true,
+                result: {
+                  file_id: "F1",
+                  file_path: o.filePath ?? "voice/file_1.oga",
+                  ...(o.fileSize !== undefined
+                    ? { file_size: o.fileSize }
+                    : {}),
+                },
+              },
+          ),
+          { status: o.getFileStatus ?? 200 },
+        ),
+      );
+    }
+    if (o.downloadThrows) {
+      // как настоящий Deno: текст ошибки содержит адрес с токеном
+      return Promise.reject(
+        new Error(`error sending request for url (${url})`),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        (o.bytes ?? new Uint8Array([1, 2, 3])).slice().buffer as ArrayBuffer,
+      ),
+    );
+  }) as typeof fetch;
+  return { fetchFn, calls };
+}
+
+Deno.test("скачивание файла: getFile → скачивание по пути, возвращает байты", async () => {
+  const { fetchFn, calls } = fakeFiles({ fileSize: 3 });
+  const bytes = await downloadTelegramFile(
+    TOKEN,
+    "F1",
+    { maxBytes: 1000 },
+    fetchFn,
+  );
+  assertEquals(Array.from(bytes), [1, 2, 3]);
+  assertEquals(calls[0].url, `https://api.telegram.org/bot${TOKEN}/getFile`);
+  assertEquals(JSON.parse(calls[0].init!.body as string), { file_id: "F1" });
+  assertEquals(
+    calls[1].url,
+    `https://api.telegram.org/file/bot${TOKEN}/voice/file_1.oga`,
+  );
+});
+
+Deno.test("скачивание файла: заявленный размер больше лимита → ошибка, файл не качаем", async () => {
+  const { fetchFn, calls } = fakeFiles({ fileSize: 9_000_000 });
+  const err = await errorOf(
+    downloadTelegramFile(TOKEN, "F1", { maxBytes: 5_000_000 }, fetchFn),
+  );
+  assertEquals(err.message.includes("слишком большой"), true);
+  assertEquals(calls.length, 1); // только getFile
+});
+
+Deno.test("скачивание файла: размер не заявлен, но байт больше лимита → ошибка", async () => {
+  const { fetchFn } = fakeFiles({ bytes: new Uint8Array(50) });
+  const err = await errorOf(
+    downloadTelegramFile(TOKEN, "F1", { maxBytes: 10 }, fetchFn),
+  );
+  assertEquals(err.message.includes("слишком большой"), true);
+});
+
+Deno.test("скачивание файла: сбои getFile и сети не раскрывают токен", async () => {
+  const a = await errorOf(
+    downloadTelegramFile(
+      TOKEN,
+      "F1",
+      { maxBytes: 100 },
+      fakeFiles({ getFileStatus: 400 }).fetchFn,
+    ),
+  );
+  assertEquals(a.message.includes(TOKEN), false);
+  const b = await errorOf(
+    downloadTelegramFile(
+      TOKEN,
+      "F1",
+      { maxBytes: 100 },
+      fakeFiles({ downloadThrows: true }).fetchFn,
+    ),
+  );
+  assertEquals(b.message.includes(TOKEN), false);
+  assertEquals(b.message.includes("Telegram"), true);
 });
