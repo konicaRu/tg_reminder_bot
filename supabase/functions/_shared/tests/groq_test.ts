@@ -202,3 +202,22 @@ Deno.test("Groq: ключ API не попадает в текст ошибки/�
   const res = await parseWithLlm("что-то", OPTS, cfg(fetchFn));
   assertEquals(JSON.stringify(res).includes("gsk_test"), false);
 });
+
+// --- «Думающие» модели (gpt-oss) тратят лимит токенов на рассуждения ----------
+
+Deno.test("Groq: gpt-oss → просим думать поменьше (reasoning_effort: low) и даём запас токенов", async () => {
+  const { fetchFn, calls } = fakeGroq(GOOD);
+  const c = { apiKey: "gsk_test", model: "openai/gpt-oss-20b", fetchFn };
+  await parseWithLlm("через пару дней в обед созвон", OPTS, c);
+  const body = JSON.parse(calls[0].init.body as string);
+  assertEquals(body.reasoning_effort, "low");
+  assertEquals(body.max_tokens >= 1000, true);
+});
+
+Deno.test("Groq: обычная модель → параметра reasoning_effort нет (иначе Groq вернёт 400)", async () => {
+  const { fetchFn, calls } = fakeGroq(GOOD);
+  await parseWithLlm("через пару дней в обед созвон", OPTS, cfg(fetchFn));
+  const body = JSON.parse(calls[0].init.body as string);
+  assertEquals("reasoning_effort" in body, false);
+  assertEquals(body.max_tokens >= 1000, true);
+});

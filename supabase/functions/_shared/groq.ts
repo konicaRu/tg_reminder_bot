@@ -72,7 +72,13 @@ export async function parseWithLlm(
       body: JSON.stringify({
         model: cfg.model,
         temperature: 0, // нужен стабильный разбор, а не «творчество»
-        max_tokens: 300,
+        // Лимит ответа. «Думающие» модели (gpt-oss) тратят часть токенов на рассуждения;
+        // при малом лимите до самого JSON дело не доходит и ответ приходит пустым.
+        max_tokens: 1500,
+        // reasoning_effort понимают только gpt-oss; другим моделям он вызвал бы ошибку 400.
+        ...(cfg.model.startsWith("openai/gpt-oss")
+          ? { reasoning_effort: "low" }
+          : {}),
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: buildSystemPrompt(opts) },
