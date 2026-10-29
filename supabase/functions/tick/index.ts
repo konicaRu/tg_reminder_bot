@@ -15,7 +15,10 @@ import {
   markReminderSent,
   releaseReminder,
 } from "../_shared/db.ts";
-import { sendTelegramMessage } from "../_shared/telegram_api.ts";
+import {
+  clearInlineKeyboard,
+  sendTelegramMessage,
+} from "../_shared/telegram_api.ts";
 import { handleRequest, runTick } from "./logic.ts";
 
 function requireEnv(name: string): string {
@@ -32,10 +35,14 @@ const run = () =>
   runTick({
     store: {
       claimDueReminders: () => claimDueReminders(db),
-      markReminderSent: (id, messageId) => markReminderSent(db, id, messageId),
+      markReminderSent: (id, messageId, next) =>
+        markReminderSent(db, id, messageId, next),
       releaseReminder: (id) => releaseReminder(db, id),
     },
-    send: (chatId, text) => sendTelegramMessage(botToken, chatId, text),
+    send: (chatId, text, markup) =>
+      sendTelegramMessage(botToken, chatId, text, fetch, markup),
+    clearKeyboard: (chatId, messageId) =>
+      clearInlineKeyboard(botToken, chatId, messageId),
     log: (message) => console.error(message),
   });
 

@@ -18,10 +18,16 @@ import type { Reminder, Session, Settings } from "../_shared/db.ts";
 import {
   buildConfirmCard,
   buildListMessage,
+  buildStoppedMessage,
   decodeCallback,
+  DEFAULT_NAG,
+  describeNag,
   escapeHtml,
   formatWhen,
   type InlineKeyboardMarkup,
+  type Nag,
+  NAG_COUNTS,
+  NAG_INTERVALS,
 } from "../_shared/telegram.ts";
 
 // --- Что нужно «мозгу» снаружи -----------------------------------------------
@@ -37,10 +43,18 @@ export type Store = {
   ): Promise<void>;
   clearSession(chatId: number): Promise<void>;
   createReminder(
-    r: { chat_id: number; text: string; remind_at: Date; rrule: string | null },
+    r: {
+      chat_id: number;
+      text: string;
+      remind_at: Date;
+      rrule: string | null;
+      nag: Nag | null; // серия повторов или null (обычное напоминание)
+    },
   ): Promise<Reminder>;
   listPendingReminders(chatId: number): Promise<Reminder[]>;
   cancelReminder(chatId: number, id: string): Promise<boolean>;
+  // «Готово»: останавливает напоминание и серию; null, если останавливать нечего
+  stopReminder(chatId: number, id: string): Promise<{ text: string } | null>;
 };
 
 // «Канал связи» с пользователем в рамках одного события (сообщения или нажатия кнопки).
@@ -117,6 +131,7 @@ type Draft = {
   text: string;
   remind_at: string; // ISO, UTC
   adjusted: "tomorrow" | null;
+  nag: Nag | null; // «🔁 Повторять»: настройки серии повторов, null = выключено
 };
 
 export function createHandlers(deps: Deps) {
@@ -132,27 +147,36 @@ export function createHandlers(deps: Deps) {
     };
   }
 
+  // Карточка по черновику (общая для первого показа и для обновления после нажатий).
+  function cardFor(draft: Draft, opts: ParseOptions) {
+    return buildConfirmCard({
+      text: draft.text,
+      remindAt: new Date(draft.remind_at),
+      draftId: draft.id,
+      timezone: opts.timezone,
+      now: opts.now,
+      adjusted: draft.adjusted ?? undefined,
+      nag: draft.nag,
+    });
+  }
+
   // Сохраняем черновик в sessions и показываем карточку подтверждения.
+  // nag переносим из предыдущего черновика, если пользователь просто сменил время.
   async function showCard(
     io: Io,
     res: Extract<ParseResult, { ok: true }>,
     opts: ParseOptions,
+    nag: Nag | null = null,
   ): Promise<void> {
     const draft: Draft = {
       id: deps.newId(),
       text: res.text,
       remind_at: res.remindAt.toISOString(),
       adjusted: res.adjusted ?? null,
+      nag,
     };
     await store.setSession(io.chatId, CONFIRM, draft);
-    const card = buildConfirmCard({
-      text: draft.text,
-      remindAt: res.remindAt,
-      draftId: draft.id,
-      timezone: opts.timezone,
-      now: opts.now,
-      adjusted: res.adjusted,
-    });
+    const card = cardFor(draft, opts);
     await io.reply(card.text, card.reply_markup);
   }
 
@@ -171,7 +195,13 @@ export function createHandlers(deps: Deps) {
     }
     // Не поняли → остаёмся в ожидании (состояние не меняем), пользователь может попробовать снова.
     if (!res.ok) return io.reply(failureMessage(res.reason));
-    return showCard(io, res, opts);
+    // Настройки повтора, выбранные до смены времени, сохраняем.
+    return showCard(
+      io,
+      res,
+      opts,
+      (payload.nag as Nag | null | undefined) ?? null,
+    );
   }
 
   return {
@@ -220,7 +250,16 @@ export function createHandlers(deps: Deps) {
         return io.answer(removed ? "Удалено" : "Уже удалено");
       }
 
-      // «OK» и «Другое время» работают с черновиком; проверяем, что карточка не устарела.
+      // «Готово» под сообщением серии: останавливаем напоминание. id здесь — id самого
+      // напоминания (а не черновика), поэтому обрабатываем до проверки черновика.
+      if (c.action === "done") {
+        const stopped = await store.stopReminder(io.chatId, c.id);
+        if (!stopped) return io.answer("Уже остановлено");
+        await io.edit(buildStoppedMessage(stopped.text)); // кнопки исчезают
+        return io.answer("Повторы остановлены");
+      }
+
+      // Остальные кнопки работают с черновиком; проверяем, что карточка не устарела.
       const session = await store.getSession(io.chatId);
       const draft = session?.state === CONFIRM
         ? (session.payload as Draft)
@@ -230,17 +269,44 @@ export function createHandlers(deps: Deps) {
       if (c.action === "ok") {
         const settings = await store.getSettings(io.chatId);
         const remindAt = new Date(draft.remind_at);
+        const nag = draft.nag ?? null;
         await store.createReminder({
           chat_id: io.chatId,
           text: draft.text,
           remind_at: remindAt,
           rrule: null,
+          nag,
         });
         await store.clearSession(io.chatId); // повторное нажатие уже не найдёт черновик → дубля нет
         const when = formatWhen(remindAt, settings.timezone, deps.now());
         await io.edit(
-          `✅ Готово! Напомню <b>${when}</b>: ${escapeHtml(draft.text)}`,
+          `✅ Готово! Напомню <b>${when}</b>: ${escapeHtml(draft.text)}` +
+            (nag ? `\n🔁 Повторю ${describeNag(nag)}` : ""),
         );
+        return io.answer();
+      }
+
+      // «🔁 Повторять / Выключить повтор», выбор интервала и количества: меняем черновик
+      // и перерисовываем карточку на месте.
+      if (c.action === "rep" || c.action === "ivl" || c.action === "cnt") {
+        let nag = draft.nag ?? null;
+        if (c.action === "rep") {
+          nag = nag ? null : { ...DEFAULT_NAG };
+        } else {
+          // callback_data приходит извне: принимаем только значения, которые есть на кнопках,
+          // и только когда повтор включён.
+          const allowed = c.action === "ivl" ? NAG_INTERVALS : NAG_COUNTS;
+          if (!nag || c.arg === undefined || !allowed.includes(c.arg)) {
+            return io.answer();
+          }
+          nag = c.action === "ivl"
+            ? { ...nag, intervalMin: c.arg }
+            : { ...nag, total: c.arg };
+        }
+        const updated: Draft = { ...draft, nag };
+        await store.setSession(io.chatId, CONFIRM, updated);
+        const card = cardFor(updated, await parseOptions(io.chatId));
+        await io.edit(card.text, card.reply_markup);
         return io.answer();
       }
 
@@ -248,6 +314,7 @@ export function createHandlers(deps: Deps) {
       await store.setSession(io.chatId, AWAITING_TIME, {
         draftId: draft.id,
         text: draft.text,
+        nag: draft.nag ?? null, // при смене времени настройки повтора не теряем
       });
       await io.edit(
         `Меняем время для: «${escapeHtml(draft.text)}»\n` +

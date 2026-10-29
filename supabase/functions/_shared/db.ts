@@ -24,6 +24,11 @@ export type Reminder = {
   attachment_file_id: string | null;
   attachment_type: "photo" | "document" | "voice" | null;
   last_message_id: number | null;
+  // «Настойчивое» напоминание (серия повторов, пока не нажмут «Готово»).
+  // nag_interval_min = null означает обычное напоминание без повторов.
+  nag_interval_min: number | null; // через сколько минут слать следующий повтор
+  nag_total: number | null; // сколько всего сообщений в серии, считая первое
+  nag_sent: number; // сколько сообщений серии уже отправлено
   created_at: string;
   updated_at: string;
 };
@@ -122,7 +127,14 @@ export async function clearSession(db: Db, chatId: number): Promise<void> {
 
 export async function createReminder(
   db: Db,
-  r: { chat_id: number; text: string; remind_at: Date; rrule?: string | null },
+  r: {
+    chat_id: number;
+    text: string;
+    remind_at: Date;
+    rrule?: string | null;
+    // повторять каждые intervalMin минут, всего total сообщений (см. миграцию nag_repeat)
+    nag?: { intervalMin: number; total: number } | null;
+  },
 ): Promise<Reminder> {
   return check(
     await db.from("reminders").insert({
@@ -130,6 +142,8 @@ export async function createReminder(
       text: r.text,
       remind_at: r.remind_at.toISOString(),
       rrule: r.rrule ?? null,
+      nag_interval_min: r.nag?.intervalMin ?? null,
+      nag_total: r.nag?.total ?? null,
     }).select().single(),
     "создание напоминания",
   ) as Reminder;
@@ -197,18 +211,52 @@ export async function claimDueReminders(db: Db): Promise<Reminder[]> {
 }
 
 // Отправили успешно: запоминаем id сообщения (понадобится для кнопок snooze в фазе 2).
+// Для серии повторов: nagSent — сколько сообщений серии теперь отправлено, nextRemindAt —
+// когда слать следующее (если не задано, серия закончена и напоминание становится sent).
+//
+// Обновление УСЛОВНОЕ (только пока статус sending): если пользователь за время отправки
+// успел нажать «Готово» (done) или 🗑 (cancelled), его решение остаётся в силе, а повтор
+// не возобновляется. Возвращает true, если запись обновилась, false, если пользователь опередил.
 export async function markReminderSent(
   db: Db,
   id: string,
   messageId: number,
-): Promise<void> {
-  check(
+  next: { nagSent?: number; nextRemindAt?: Date } = {},
+): Promise<boolean> {
+  const rows = check(
     await db.from("reminders").update({
-      status: "sent",
+      status: next.nextRemindAt ? "pending" : "sent",
       last_message_id: messageId,
-    }).eq("id", id),
+      ...(next.nagSent !== undefined ? { nag_sent: next.nagSent } : {}),
+      ...(next.nextRemindAt
+        ? { remind_at: next.nextRemindAt.toISOString() }
+        : {}),
+    }).eq("id", id).eq("status", "sending").select("id"),
     "отметка «отправлено»",
   );
+  return (rows?.length ?? 0) > 0;
+}
+
+// «Готово»: останавливает напоминание (и серию повторов). Работает, пока оно не отменено:
+// в ожидании, в момент отправки или уже отправлено. Условие chat_id защищает от чужих.
+// Возвращает текст напоминания (чтобы показать «✅ Готово: …») или null, если останавливать
+// нечего (уже остановлено, отменено, чужое).
+export async function stopReminder(
+  db: Db,
+  chatId: number,
+  id: string,
+): Promise<{ text: string } | null> {
+  const rows = check(
+    await db.from("reminders").update({ status: "done" })
+      .eq("id", id).eq("chat_id", chatId).in("status", [
+        "pending",
+        "sending",
+        "sent",
+      ])
+      .select("text"),
+    "остановка напоминания",
+  );
+  return rows && rows.length > 0 ? { text: rows[0].text as string } : null;
 }
 
 // Отправка не удалась: возвращаем в pending, следующий запуск tick попробует снова.

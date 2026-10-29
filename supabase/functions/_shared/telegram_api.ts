@@ -5,6 +5,8 @@
 // Токен — пароль бота. Ошибки сети в Deno содержат этот адрес целиком, а ошибки попадают в логи.
 // Поэтому здесь все ошибки «чистятся»: наружу выходит только то, что токен не раскрывает.
 
+import type { InlineKeyboardMarkup } from "./telegram.ts";
+
 const TIMEOUT_MS = 10_000;
 
 // Вызывает любой метод Bot API (sendMessage, setWebhook, getWebhookInfo…) и возвращает поле result.
@@ -50,16 +52,23 @@ export async function callTelegramApi(
 }
 
 // Отправляет HTML-сообщение и возвращает id отправленного сообщения (message_id).
+// replyMarkup — необязательные inline-кнопки под сообщением.
 export async function sendTelegramMessage(
   token: string,
   chatId: number,
   text: string,
   fetchFn: typeof fetch = fetch,
+  replyMarkup?: InlineKeyboardMarkup,
 ): Promise<number> {
   const result = await callTelegramApi(
     token,
     "sendMessage",
-    { chat_id: chatId, text, parse_mode: "HTML" },
+    {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    },
     fetchFn,
   );
   const messageId = (result as { message_id?: unknown } | undefined)
@@ -68,4 +77,25 @@ export async function sendTelegramMessage(
     throw new Error("Telegram: в ответе нет message_id");
   }
   return messageId;
+}
+
+// Убирает кнопки у уже отправленного сообщения (текст остаётся). Нужна, чтобы у цепочки
+// повторных напоминаний кнопка «Готово» была только у самого свежего сообщения.
+// При ошибке (например, сообщение удалено) бросает исключение: вызывающий решает, важно ли это.
+export async function clearInlineKeyboard(
+  token: string,
+  chatId: number,
+  messageId: number,
+  fetchFn: typeof fetch = fetch,
+): Promise<void> {
+  await callTelegramApi(
+    token,
+    "editMessageReplyMarkup",
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] },
+    },
+    fetchFn,
+  );
 }

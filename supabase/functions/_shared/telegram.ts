@@ -16,11 +16,38 @@ import { localParts } from "./parser/tz.ts";
 export type InlineButton = { text: string; callback_data: string };
 export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 
-// Что делает кнопка: подтвердить черновик / выбрать другое время / удалить напоминание.
-export type CallbackAction = "ok" | "other" | "del";
+// Что делает кнопка:
+//   ok    — подтвердить черновик          other — выбрать другое время
+//   del   — удалить напоминание из /list  done  — «Готово»: остановить повторы
+//   rep   — включить/выключить повтор     ivl   — выбрать интервал повтора (минуты)
+//   cnt   — выбрать, сколько всего сообщений в серии повторов
+export type CallbackAction =
+  | "ok"
+  | "other"
+  | "del"
+  | "done"
+  | "rep"
+  | "ivl"
+  | "cnt";
+
+// «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
+// (считая первое), пока пользователь не нажмёт «Готово».
+export type Nag = { intervalMin: number; total: number };
+
+// Что предлагаем на кнопках и что берём по умолчанию.
+export const NAG_INTERVALS = [5, 10, 30, 60]; // минуты
+export const NAG_COUNTS = [3, 5, 10, 20]; // всего сообщений
+export const DEFAULT_NAG: Nag = { intervalMin: 5, total: 10 };
 
 // Минимум полей напоминания, который нужен для списка.
-export type ListItem = { id: string; text: string; remind_at: string };
+export type ListItem = {
+  id: string;
+  text: string;
+  remind_at: string;
+  nag_interval_min?: number | null;
+  nag_total?: number | null;
+  nag_sent?: number;
+};
 
 const MAX_LIST_ITEMS = 20; // в одном сообщении показываем не больше 20 напоминаний
 const BUTTONS_PER_ROW = 5; // кнопок 🗑 в одном ряду
@@ -47,29 +74,64 @@ export function escapeHtml(s: string): string {
   );
 }
 
-// --- Данные кнопок (callback_data) -------------------------------------------
-// В callback_data Telegram разрешает только строку до 64 байт, поэтому пакуем так:
-// «действие:идентификатор», например «ok:a1b2c3d4» или «del:<uuid>».
-
-export function encodeCallback(
-  c: { action: CallbackAction; id: string },
-): string {
-  return `${c.action}:${c.id}`;
+// Интервал для человека: 5 → «5 мин», 60 → «1 час», 120 → «2 ч».
+function formatInterval(minutes: number): string {
+  if (minutes === 60) return "1 час";
+  if (minutes > 60 && minutes % 60 === 0) return `${minutes / 60} ч`;
+  return `${minutes} мин`;
 }
 
-// Обратно: из строки в {действие, id}. Всё, что не похоже на наш формат, → null.
+// «3 раза», но «5 раз», «10 раз», «11 раз», «22 раза».
+function formatTimes(n: number): string {
+  const lastTwo = n % 100;
+  const last = n % 10;
+  const few = last >= 2 && last <= 4 && !(lastTwo >= 12 && lastTwo <= 14);
+  return `${n} ${few ? "раза" : "раз"}`;
+}
+
+// Серия повторов словами: «каждые 5 мин, всего 10 раз».
+export function describeNag(nag: Nag): string {
+  return `каждые ${formatInterval(nag.intervalMin)}, всего ${
+    formatTimes(nag.total)
+  }`;
+}
+
+// --- Данные кнопок (callback_data) -------------------------------------------
+// В callback_data Telegram разрешает только строку до 64 байт, поэтому пакуем так:
+// «действие:идентификатор» («ok:a1b2c3d4», «del:<uuid>») или, если нужно число,
+// «действие:идентификатор:число» («ivl:a1b2c3d4:30»).
+
+export function encodeCallback(
+  c: { action: CallbackAction; id: string; arg?: number },
+): string {
+  return c.arg === undefined
+    ? `${c.action}:${c.id}`
+    : `${c.action}:${c.id}:${c.arg}`;
+}
+
+// Обратно: из строки в {действие, id, число}. Всё, что не похоже на наш формат, → null.
 // Это защита: callback_data приходит извне, и верить ей вслепую нельзя.
 export function decodeCallback(
   data: string,
-): { action: CallbackAction; id: string } | null {
-  const m = /^(ok|other|del):([A-Za-z0-9_-]{1,60})$/.exec(data);
-  return m ? { action: m[1] as CallbackAction, id: m[2] } : null;
+): { action: CallbackAction; id: string; arg?: number } | null {
+  const plain = /^(ok|other|del|done|rep):([A-Za-z0-9_-]{1,60})$/.exec(data);
+  if (plain) return { action: plain[1] as CallbackAction, id: plain[2] };
+  const withArg = /^(ivl|cnt):([A-Za-z0-9_-]{1,50}):(\d{1,4})$/.exec(data);
+  if (withArg) {
+    return {
+      action: withArg[1] as CallbackAction,
+      id: withArg[2],
+      arg: Number(withArg[3]),
+    };
+  }
+  return null;
 }
 
 // --- Карточка подтверждения --------------------------------------------------
 // Ничего не сохраняется в базу, пока пользователь не нажмёт «✅ OK»: так ошибка разбора даты
 // не превращается в пропущенную встречу. draftId — короткий код черновика: нужен, чтобы кнопки
 // старой карточки не подтвердили чужой, более новый черновик.
+// Если nag задан, карточка показывает настройки повтора и кнопки их изменения.
 export function buildConfirmCard(a: {
   text: string;
   remindAt: Date;
@@ -77,26 +139,38 @@ export function buildConfirmCard(a: {
   timezone: string;
   now: Date;
   adjusted?: "tomorrow";
+  nag?: Nag | null;
 }): { text: string; reply_markup: InlineKeyboardMarkup } {
   const when = formatWhen(a.remindAt, a.timezone, a.now);
   const note = a.adjusted === "tomorrow"
     ? "Это время сегодня уже прошло, поэтому предлагаю завтра.\n"
     : "";
-  return {
-    text: `${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`,
-    reply_markup: {
-      inline_keyboard: [[
-        {
-          text: "✅ OK",
-          callback_data: encodeCallback({ action: "ok", id: a.draftId }),
-        },
-        {
-          text: "🕐 Другое время",
-          callback_data: encodeCallback({ action: "other", id: a.draftId }),
-        },
-      ]],
-    },
-  };
+  const cb = (action: CallbackAction, arg?: number) =>
+    encodeCallback({ action, id: a.draftId, arg });
+
+  let text = `${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`;
+  const rows: InlineButton[][] = [[
+    { text: "✅ OK", callback_data: cb("ok") },
+    { text: "🕐 Другое время", callback_data: cb("other") },
+  ]];
+
+  if (!a.nag) {
+    rows.push([{ text: "🔁 Повторять", callback_data: cb("rep") }]);
+  } else {
+    const nag = a.nag;
+    text += `\n🔁 Повторю ${describeNag(nag)}, пока не нажмёшь «Готово»`;
+    rows.push([{ text: "🔁 Выключить повтор", callback_data: cb("rep") }]);
+    // Отметка ✓ стоит у выбранного значения.
+    rows.push(NAG_INTERVALS.map((m) => ({
+      text: `${formatInterval(m)}${m === nag.intervalMin ? " ✓" : ""}`,
+      callback_data: cb("ivl", m),
+    })));
+    rows.push(NAG_COUNTS.map((n) => ({
+      text: `×${n}${n === nag.total ? " ✓" : ""}`,
+      callback_data: cb("cnt", n),
+    })));
+  }
+  return { text, reply_markup: { inline_keyboard: rows } };
 }
 
 // --- Список напоминаний (/list) ----------------------------------------------
@@ -109,11 +183,19 @@ export function buildListMessage(
   if (items.length === 0) return { text: "Напоминаний пока нет." };
 
   const shown = items.slice(0, MAX_LIST_ITEMS);
-  const lines = shown.map((it, i) =>
-    `${i + 1}. ${formatWhen(new Date(it.remind_at), tz, now)} — ${
+  const lines = shown.map((it, i) => {
+    let line = `${i + 1}. ${formatWhen(new Date(it.remind_at), tz, now)} — ${
       escapeHtml(it.text)
-    }`
-  );
+    }`;
+    // У напоминаний с повтором — отметка 🔁 и сколько сообщений серии уже ушло.
+    if (it.nag_interval_min && it.nag_total) {
+      line += ` 🔁 каждые ${
+        formatInterval(it.nag_interval_min)
+      } ×${it.nag_total}`;
+      if (it.nag_sent) line += ` (отправлено ${it.nag_sent})`;
+    }
+    return line;
+  });
   let text = `Твои напоминания:\n${lines.join("\n")}`;
   if (items.length > shown.length) {
     text += `\n\nПоказаны ближайшие ${shown.length} из ${items.length}.`;
@@ -132,6 +214,26 @@ export function buildListMessage(
 }
 
 // --- Сообщение, когда напоминание сработало ----------------------------------
-export function buildReminderMessage(text: string): string {
-  return `⏰ <b>Напоминание</b>\n${escapeHtml(text)}`;
+// Для серии повторов в заголовке «(2 из 10)».
+export function buildReminderMessage(
+  text: string,
+  progress?: { index: number; total: number },
+): string {
+  const counter = progress ? ` (${progress.index} из ${progress.total})` : "";
+  return `⏰ <b>Напоминание</b>${counter}\n${escapeHtml(text)}`;
+}
+
+// Кнопка «Готово» под сообщением серии: нажатие останавливает повторы.
+export function buildDoneKeyboard(reminderId: string): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{
+      text: "✅ Готово",
+      callback_data: encodeCallback({ action: "done", id: reminderId }),
+    }]],
+  };
+}
+
+// Во что превращается сообщение после нажатия «Готово».
+export function buildStoppedMessage(text: string): string {
+  return `✅ <b>Готово</b>\n${escapeHtml(text)}`;
 }

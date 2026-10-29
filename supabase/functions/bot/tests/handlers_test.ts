@@ -53,9 +53,22 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
         remind_at: r.remind_at.toISOString(),
         rrule: r.rrule,
         status: "pending",
+        nag_interval_min: r.nag?.intervalMin ?? null,
+        nag_total: r.nag?.total ?? null,
+        nag_sent: 0,
       } as Reminder;
       reminders.push(row);
       return Promise.resolve(row);
+    },
+    // «Готово»: останавливает напоминание, пока оно не отменено (как в db.ts)
+    stopReminder: (chatId, id) => {
+      const r = reminders.find((x) =>
+        x.id === id && x.chat_id === chatId &&
+        ["pending", "sending", "sent"].includes(x.status)
+      );
+      if (!r) return Promise.resolve(null);
+      r.status = "done";
+      return Promise.resolve({ text: r.text });
     },
     listPendingReminders: (chatId) =>
       Promise.resolve(
@@ -170,6 +183,7 @@ Deno.test("текст: показываем карточку, в базу НИЧ
       text: "проверка",
       remind_at: "2026-10-28T09:03:00.000Z",
       adjusted: null,
+      nag: null, // повтор по умолчанию выключен
     },
   });
 });
@@ -372,5 +386,186 @@ Deno.test("фото/голос/файл: пока понимаем только 
   assertEquals(
     t.sent[0].text,
     "Пока понимаю только текст. Напиши, например: «завтра в 11 встреча».",
+  );
+});
+
+// =============================================================================
+// «Настойчивое» напоминание: 🔁 повтор на карточке и кнопка «✅ Готово»
+// =============================================================================
+
+// Открывает карточку «завтра в 11 встреча» и возвращает окружение.
+async function withCard() {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  return t;
+}
+const lastEdit = (sent: Sent[]) =>
+  sent.filter((s) => s.kind === "edit").at(-1)!;
+const lastAnswer = (sent: Sent[]) =>
+  sent.filter((s) => s.kind === "answer").at(-1)!;
+
+Deno.test("повтор: на новой карточке есть кнопка «🔁 Повторять», повтор выключен", async () => {
+  const t = await withCard();
+  buttonData(t.sent, "Повторять"); // кнопка найдена (иначе тест упадёт)
+  assertEquals((t.sessions.get(CHAT)!.payload as { nag: unknown }).nag, null);
+});
+
+Deno.test("повтор: «🔁 Повторять» включает значения по умолчанию (каждые 5 мин, 10 раз) и обновляет карточку на месте", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  assertEquals(
+    (t.sessions.get(CHAT)!.payload as { nag: unknown }).nag,
+    { intervalMin: 5, total: 10 },
+  );
+  const edit = lastEdit(t.sent);
+  assertEquals(
+    edit.text,
+    "Напомню <b>29.10 в 11:00</b>: встреча\n" +
+      "🔁 Повторю каждые 5 мин, всего 10 раз, пока не нажмёшь «Готово»",
+  );
+  buttonData(t.sent, "Выключить повтор"); // на карточке теперь кнопка выключения
+  assertEquals(t.reminders.length, 0); // всё ещё не сохранено
+});
+
+Deno.test("повтор: повторное нажатие выключает повтор", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "Выключить повтор"));
+  assertEquals((t.sessions.get(CHAT)!.payload as { nag: unknown }).nag, null);
+  assertEquals(lastEdit(t.sent).text, "Напомню <b>29.10 в 11:00</b>: встреча");
+});
+
+Deno.test("повтор: выбор интервала и количества меняет карточку", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "30 мин"));
+  await t.h.callback(t.io, buttonData(t.sent, "×20"));
+  assertEquals(
+    (t.sessions.get(CHAT)!.payload as { nag: unknown }).nag,
+    { intervalMin: 30, total: 20 },
+  );
+  assertEquals(
+    lastEdit(t.sent).text!.endsWith(
+      "🔁 Повторю каждые 30 мин, всего 20 раз, пока не нажмёшь «Готово»",
+    ),
+    true,
+  );
+});
+
+Deno.test("повтор: значения вне списка кнопок игнорируем (callback_data приходит извне)", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  const id = (t.sessions.get(CHAT)!.payload as { id: string }).id;
+  await t.h.callback(t.io, `ivl:${id}:7`); // такого интервала нет на кнопках
+  await t.h.callback(t.io, `cnt:${id}:1000`);
+  await t.h.callback(t.io, `ivl:${id}:0`);
+  assertEquals(
+    (t.sessions.get(CHAT)!.payload as { nag: unknown }).nag,
+    { intervalMin: 5, total: 10 },
+  );
+});
+
+Deno.test("повтор: выбор интервала при выключенном повторе ничего не включает", async () => {
+  const t = await withCard();
+  const id = (t.sessions.get(CHAT)!.payload as { id: string }).id;
+  await t.h.callback(t.io, `ivl:${id}:30`);
+  assertEquals((t.sessions.get(CHAT)!.payload as { nag: unknown }).nag, null);
+});
+
+Deno.test("повтор: кнопки старой карточки → «устарела», черновик не меняется", async () => {
+  const t = await withCard();
+  const oldRep = buttonData(t.sent, "Повторять");
+  await t.h.text(t.io, "завтра в 12 созвон"); // новая карточка, старая устарела
+  await t.h.callback(t.io, oldRep);
+  assertEquals((t.sessions.get(CHAT)!.payload as { nag: unknown }).nag, null);
+  assertEquals(lastAnswer(t.sent).text!.includes("устарела"), true);
+});
+
+Deno.test("повтор: «OK» сохраняет серию в напоминании и показывает её в «Готово»", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "10 мин"));
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders.length, 1);
+  assertEquals([t.reminders[0].nag_interval_min, t.reminders[0].nag_total], [
+    10,
+    10,
+  ]);
+  assertEquals(
+    lastEdit(t.sent).text,
+    "✅ Готово! Напомню <b>29.10 в 11:00</b>: встреча\n🔁 Повторю каждые 10 мин, всего 10 раз",
+  );
+});
+
+Deno.test("повтор: без включённого повтора «OK» сохраняет обычное напоминание", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals([t.reminders[0].nag_interval_min, t.reminders[0].nag_total], [
+    null,
+    null,
+  ]);
+});
+
+Deno.test("повтор: настройки не теряются, если сменить время («Другое время»)", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "30 мин"));
+  await t.h.callback(t.io, buttonData(t.sent, "Другое время"));
+  await t.h.text(t.io, "завтра в 12");
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(
+    card.text,
+    "Напомню <b>29.10 в 12:00</b>: встреча\n" +
+      "🔁 Повторю каждые 30 мин, всего 10 раз, пока не нажмёшь «Готово»",
+  );
+});
+
+Deno.test("список: напоминание с повтором показано с отметкой 🔁", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
+    "Твои напоминания:\n1. 29.10 в 11:00 — встреча 🔁 каждые 5 мин ×10",
+  );
+});
+
+// --- Кнопка «✅ Готово» под сообщением серии -----------------------------------------
+
+Deno.test("Готово: останавливает напоминание, сообщение превращается в «✅ Готово» без кнопок", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.callback(t.io, "done:rem-1");
+  assertEquals(t.reminders[0].status, "done");
+  const edit = lastEdit(t.sent);
+  assertEquals(edit.text, "✅ <b>Готово</b>\nвстреча");
+  assertEquals(edit.markup, undefined);
+  assertEquals(lastAnswer(t.sent).text, "Повторы остановлены");
+});
+
+Deno.test("Готово: повторное нажатие → «Уже остановлено», без ошибки", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.callback(t.io, "done:rem-1");
+  await t.h.callback(t.io, "done:rem-1");
+  assertEquals(lastAnswer(t.sent).text, "Уже остановлено");
+});
+
+Deno.test("Готово: несуществующее напоминание → «Уже остановлено»", async () => {
+  const t = setup();
+  await t.h.callback(t.io, "done:nope");
+  assertEquals(lastAnswer(t.sent).text, "Уже остановлено");
+});
+
+Deno.test("Готово: после остановки серия не показывается в /list", async () => {
+  const t = await withCard();
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.callback(t.io, "done:rem-1");
+  await t.h.list(t.io);
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
+    "Напоминаний пока нет.",
   );
 });

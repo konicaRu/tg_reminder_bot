@@ -20,6 +20,7 @@ import {
   getSettings,
   listPendingReminders,
   setSession,
+  stopReminder,
 } from "../_shared/db.ts";
 import { parseWithLlm } from "../_shared/groq.ts";
 import { parseReminder } from "../_shared/parser/mod.ts";
@@ -58,6 +59,7 @@ const store: Store = {
   createReminder: (r) => createReminder(db, r),
   listPendingReminders: (chatId) => listPendingReminders(db, chatId),
   cancelReminder: (chatId, id) => cancelReminder(db, chatId, id),
+  stopReminder: (chatId, id) => stopReminder(db, chatId, id),
 };
 
 const handlers = createHandlers({

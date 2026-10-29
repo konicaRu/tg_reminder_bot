@@ -3,7 +3,11 @@
 // потому что ошибки пишутся в логи, а токен — это пароль бота.
 
 import { deepStrictEqual as assertEquals } from "node:assert";
-import { callTelegramApi, sendTelegramMessage } from "../telegram_api.ts";
+import {
+  callTelegramApi,
+  clearInlineKeyboard,
+  sendTelegramMessage,
+} from "../telegram_api.ts";
 
 const TOKEN = "123456:SECRET-TOKEN-VALUE";
 
@@ -121,4 +125,55 @@ Deno.test("callTelegramApi: сеть упала → без адреса и то�
   const err = await errorOf(callTelegramApi(TOKEN, "setWebhook", {}, fetchFn));
   assertEquals(err.message.includes("SECRET-TOKEN-VALUE"), false);
   assertEquals(err.message.includes("api.telegram.org"), false);
+});
+
+// --- Кнопки под сообщением и их снятие -------------------------------------------
+
+Deno.test("sendMessage: с кнопками → reply_markup попадает в запрос", async () => {
+  const { fetchFn, calls } = fakeFetch(200, {
+    ok: true,
+    result: { message_id: 7 },
+  });
+  const markup = {
+    inline_keyboard: [[{ text: "✅ Готово", callback_data: "done:x" }]],
+  };
+  await sendTelegramMessage(TOKEN, 555, "текст", fetchFn, markup);
+  assertEquals(JSON.parse(calls[0].init.body as string).reply_markup, markup);
+});
+
+Deno.test("sendMessage: без кнопок → поля reply_markup в запросе нет", async () => {
+  const { fetchFn, calls } = fakeFetch(200, {
+    ok: true,
+    result: { message_id: 7 },
+  });
+  await sendTelegramMessage(TOKEN, 555, "текст", fetchFn);
+  assertEquals(
+    "reply_markup" in JSON.parse(calls[0].init.body as string),
+    false,
+  );
+});
+
+Deno.test("clearInlineKeyboard: просит Telegram убрать кнопки у конкретного сообщения", async () => {
+  const { fetchFn, calls } = fakeFetch(200, { ok: true, result: true });
+  await clearInlineKeyboard(TOKEN, 555, 42, fetchFn);
+  assertEquals(
+    calls[0].url,
+    `https://api.telegram.org/bot${TOKEN}/editMessageReplyMarkup`,
+  );
+  assertEquals(JSON.parse(calls[0].init.body as string), {
+    chat_id: 555,
+    message_id: 42,
+    reply_markup: { inline_keyboard: [] },
+  });
+});
+
+Deno.test("clearInlineKeyboard: ошибка Telegram → исключение без токена (вызывающий решает, игнорировать ли)", async () => {
+  const { fetchFn } = fakeFetch(400, {
+    ok: false,
+    error_code: 400,
+    description: "Bad Request: message to edit not found",
+  });
+  const err = await errorOf(clearInlineKeyboard(TOKEN, 555, 42, fetchFn));
+  assertEquals(err.message.includes("message to edit not found"), true);
+  assertEquals(err.message.includes("SECRET-TOKEN-VALUE"), false);
 });

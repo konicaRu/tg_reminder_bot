@@ -12,6 +12,7 @@ import {
 
 const SECRET = "tick-secret-123";
 
+// Обычное напоминание (без серии повторов).
 const rem = (id: string, chat: number, text: string): Reminder =>
   ({
     id,
@@ -19,16 +20,47 @@ const rem = (id: string, chat: number, text: string): Reminder =>
     text,
     status: "sending",
     remind_at: "2026-10-29T08:00:00Z",
+    nag_interval_min: null,
+    nag_total: null,
+    nag_sent: 0,
+    last_message_id: null,
   }) as Reminder;
+
+// Напоминание с серией: каждые intervalMin минут, всего total; sent уже отправлено;
+// lastMsg — id предыдущего сообщения серии (у кого sent = 0, его нет).
+const nagRem = (
+  id: string,
+  o: { interval: number; total: number; sent: number; lastMsg?: number },
+): Reminder => ({
+  ...rem(id, 555, "лекарство"),
+  nag_interval_min: o.interval,
+  nag_total: o.total,
+  nag_sent: o.sent,
+  last_message_id: o.lastMsg ?? null,
+});
+
+// «Сейчас» для tick в тестах: новое время повтора считается от него.
+const NOW = new Date("2026-10-29T08:00:30Z");
 
 // Двойник: что «лежит в очереди» и что с ней сделали.
 function setup(
   due: Reminder[],
-  opts: { failSendFor?: string[]; claimThrows?: boolean } = {},
+  opts: {
+    failSendFor?: string[];
+    claimThrows?: boolean;
+    userStoppedFirst?: boolean; // пользователь нажал «Готово», пока шла отправка
+    clearThrows?: boolean;
+  } = {},
 ) {
-  const sentMessages: { chatId: number; text: string }[] = [];
-  const marked: { id: string; messageId: number }[] = [];
+  const sentMessages: { chatId: number; text: string; markup?: unknown }[] = [];
+  const marked: {
+    id: string;
+    messageId: number;
+    next: { nagSent?: number; nextRemindAt?: Date };
+  }[] = [];
   const released: string[] = [];
+  const cleared: { chatId: number; messageId: number; afterSends: number }[] =
+    [];
   const logs: string[] = [];
   let claimCalls = 0;
   let messageCounter = 100;
@@ -39,9 +71,10 @@ function setup(
       if (opts.claimThrows) return Promise.reject(new Error("база недоступна"));
       return Promise.resolve(due);
     },
-    markReminderSent: (id, messageId) => {
-      marked.push({ id, messageId });
-      return Promise.resolve();
+    markReminderSent: (id, messageId, next) => {
+      marked.push({ id, messageId, next });
+      // false = запись уже не в статусе sending (пользователь успел нажать «Готово»)
+      return Promise.resolve(!opts.userStoppedFirst);
     },
     releaseReminder: (id) => {
       released.push(id);
@@ -49,20 +82,38 @@ function setup(
     },
   };
 
-  const send = (chatId: number, text: string) => {
+  const send = (chatId: number, text: string, markup?: unknown) => {
     if (opts.failSendFor?.some((t) => text.includes(t))) {
       return Promise.reject(new Error("Telegram: 500"));
     }
-    sentMessages.push({ chatId, text });
+    // поле markup записываем только если кнопки были: так проще сравнивать с ожидаемым
+    sentMessages.push(
+      markup === undefined ? { chatId, text } : { chatId, text, markup },
+    );
     return Promise.resolve(++messageCounter);
   };
 
-  const deps = { store, send, log: (m: string) => logs.push(m) };
+  // «Снять кнопки у старого сообщения»; запоминаем, после скольких отправок это произошло.
+  const clearKeyboard = (chatId: number, messageId: number) => {
+    cleared.push({ chatId, messageId, afterSends: sentMessages.length });
+    return opts.clearThrows
+      ? Promise.reject(new Error("Telegram: 400 message to edit not found"))
+      : Promise.resolve();
+  };
+
+  const deps = {
+    store,
+    send,
+    clearKeyboard,
+    now: () => NOW,
+    log: (m: string) => logs.push(m),
+  };
   return {
     deps,
     sentMessages,
     marked,
     released,
+    cleared,
     logs,
     claimCalls: () => claimCalls,
   };
@@ -84,7 +135,8 @@ Deno.test("tick: отправляет текст напоминания в ну�
     chatId: 555,
     text: "⏰ <b>Напоминание</b>\nвстреча",
   }]);
-  assertEquals(t.marked, [{ id: "r1", messageId: 101 }]); // запомнили id сообщения
+  // запомнили id сообщения; у обычного напоминания повторов нет → next пустой
+  assertEquals(t.marked, [{ id: "r1", messageId: 101, next: {} }]);
   assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
 });
 
@@ -220,4 +272,117 @@ Deno.test("HTTP: сбой внутри → 500 без подробностей �
   assertEquals(res.status, 500);
   const text = await res.text();
   assertEquals(text.includes("база недоступна"), false);
+});
+
+// =============================================================================
+// «Настойчивое» напоминание: серия повторов до «Готово»
+// =============================================================================
+
+const doneButton = (id: string) => ({
+  inline_keyboard: [[{ text: "✅ Готово", callback_data: `done:${id}` }]],
+});
+
+Deno.test("серия: первое сообщение «(1 из 3)» с кнопкой «Готово»; запись возвращается в очередь на now + интервал", async () => {
+  const t = setup([nagRem("n1", { interval: 5, total: 3, sent: 0 })]);
+  const summary = await runTick(t.deps);
+  assertEquals(t.sentMessages, [{
+    chatId: 555,
+    text: "⏰ <b>Напоминание</b> (1 из 3)\nлекарство",
+    markup: doneButton("n1"),
+  }]);
+  assertEquals(t.marked, [{
+    id: "n1",
+    messageId: 101,
+    // от момента отправки (NOW), а не от старого срока: после сбоя не будет «пачки» повторов
+    next: { nagSent: 1, nextRemindAt: new Date("2026-10-29T08:05:30Z") },
+  }]);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+});
+
+Deno.test("серия: у первого сообщения нет предыдущего, снимать кнопки не у кого", async () => {
+  const t = setup([nagRem("n1", { interval: 5, total: 3, sent: 0 })]);
+  await runTick(t.deps);
+  assertEquals(t.cleared, []);
+});
+
+Deno.test("серия: второе сообщение «(2 из 3)»; у предыдущего сообщения кнопка снимается ПОСЛЕ успешной отправки", async () => {
+  const t = setup([
+    nagRem("n1", { interval: 10, total: 3, sent: 1, lastMsg: 77 }),
+  ]);
+  await runTick(t.deps);
+  assertEquals(
+    t.sentMessages[0].text,
+    "⏰ <b>Напоминание</b> (2 из 3)\nлекарство",
+  );
+  assertEquals(t.marked[0].next, {
+    nagSent: 2,
+    nextRemindAt: new Date("2026-10-29T08:10:30Z"),
+  });
+  // кнопку у старого сообщения (id 77) убрали, и только когда новое уже ушло (afterSends = 1)
+  assertEquals(t.cleared, [{ chatId: 555, messageId: 77, afterSends: 1 }]);
+});
+
+Deno.test("серия: последнее сообщение «(3 из 3)» → повтор больше не планируется, статус sent", async () => {
+  const t = setup([
+    nagRem("n1", { interval: 5, total: 3, sent: 2, lastMsg: 88 }),
+  ]);
+  await runTick(t.deps);
+  assertEquals(
+    t.sentMessages[0].text,
+    "⏰ <b>Напоминание</b> (3 из 3)\nлекарство",
+  );
+  // кнопка «Готово» остаётся и на последнем сообщении (нажатие просто отмечает «Готово»)
+  assertEquals(t.sentMessages[0].markup, doneButton("n1"));
+  // nextRemindAt нет → db.markReminderSent поставит статус sent
+  assertEquals(t.marked[0].next, { nagSent: 3 });
+});
+
+Deno.test("серия: не удалось отправить → в очередь, счётчик не растёт, кнопку у старого сообщения НЕ снимаем", async () => {
+  const t = setup(
+    [nagRem("n1", { interval: 5, total: 3, sent: 1, lastMsg: 77 })],
+    { failSendFor: ["лекарство"] },
+  );
+  const summary = await runTick(t.deps);
+  assertEquals(t.released, ["n1"]);
+  assertEquals(t.marked, []);
+  assertEquals(t.cleared, []); // у пользователя остаётся рабочая кнопка «Готово»
+  assertEquals(summary, { claimed: 1, sent: 0, failed: 1 });
+});
+
+Deno.test("серия: «Готово» нажали, пока шла отправка → не ошибка и не в очередь (решение пользователя главнее)", async () => {
+  const t = setup(
+    [nagRem("n1", { interval: 5, total: 3, sent: 0 })],
+    { userStoppedFirst: true },
+  );
+  const summary = await runTick(t.deps);
+  assertEquals(t.released, []); // не возвращаем в pending
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 }); // сообщение ведь ушло
+  assertEquals(t.logs, []); // это штатная ситуация, шума в логах нет
+});
+
+Deno.test("серия: сбой снятия кнопки у старого сообщения не мешает, пишется в лог без текста напоминания", async () => {
+  const t = setup(
+    [nagRem("n1", { interval: 5, total: 3, sent: 1, lastMsg: 77 })],
+    { clearThrows: true },
+  );
+  const summary = await runTick(t.deps);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+  assertEquals(t.marked.length, 1); // следующий повтор запланирован, несмотря на сбой
+  assertEquals(t.logs.length, 1);
+  assertEquals(t.logs[0].includes("n1"), true);
+  assertEquals(t.logs[0].includes("лекарство"), false);
+});
+
+Deno.test("серия вперемешку с обычными: каждое обрабатывается по своим правилам", async () => {
+  const t = setup([
+    rem("r1", 1, "обычное"),
+    nagRem("n1", { interval: 5, total: 3, sent: 0 }),
+  ]);
+  await runTick(t.deps);
+  assertEquals(t.sentMessages[0], {
+    chatId: 1,
+    text: "⏰ <b>Напоминание</b>\nобычное",
+  });
+  assertEquals(t.marked[0].next, {}); // обычное → sent
+  assertEquals(t.marked[1].next.nagSent, 1); // серия → ещё повторы
 });

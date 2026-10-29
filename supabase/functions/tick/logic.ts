@@ -6,19 +6,37 @@
 // Как и в bot, база и Telegram приходят снаружи (см. TickDeps): так всё проверяется тестами.
 
 import type { Reminder } from "../_shared/db.ts";
-import { buildReminderMessage } from "../_shared/telegram.ts";
+import {
+  buildDoneKeyboard,
+  buildReminderMessage,
+  type InlineKeyboardMarkup,
+} from "../_shared/telegram.ts";
 
 // Что tick нужно от базы (в проде это функции из _shared/db.ts).
 export type TickStore = {
   claimDueReminders(): Promise<Reminder[]>; // атомарно забрать наступившие (pending → sending)
-  markReminderSent(id: string, messageId: number): Promise<void>;
+  // Отметить отправку. Без next → статус sent. С nextRemindAt → серия продолжается:
+  // запись возвращается в pending на это время, nagSent — сколько сообщений серии ушло.
+  // Возвращает false, если пользователь успел нажать «Готово» или 🗑 (запись уже не sending).
+  markReminderSent(
+    id: string,
+    messageId: number,
+    next: { nagSent?: number; nextRemindAt?: Date },
+  ): Promise<boolean>;
   releaseReminder(id: string): Promise<void>; // вернуть в очередь (sending → pending)
 };
 
 export type TickDeps = {
   store: TickStore;
-  // Отправить сообщение в Telegram, вернуть id отправленного сообщения.
-  send: (chatId: number, text: string) => Promise<number>;
+  // Отправить сообщение в Telegram (с кнопками или без), вернуть id отправленного сообщения.
+  send: (
+    chatId: number,
+    text: string,
+    markup?: InlineKeyboardMarkup,
+  ) => Promise<number>;
+  // Убрать кнопки у уже отправленного сообщения (необязательно: без него просто не убираем).
+  clearKeyboard?: (chatId: number, messageId: number) => Promise<void>;
+  now?: () => Date; // «сейчас» (в тестах фиксированное)
   log?: (message: string) => void;
 };
 
@@ -37,9 +55,19 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
 
   // 2. Отправляем по одному. Сбой одного напоминания не должен останавливать остальные.
   for (const r of due) {
+    // «Настойчивое» напоминание: серия сообщений «(k из N)» с кнопкой «Готово».
+    const interval = r.nag_interval_min;
+    const total = r.nag_total;
+    const isNag = interval != null && total != null;
+    const index = (r.nag_sent ?? 0) + 1; // номер сообщения, которое отправляем сейчас
+
     let messageId: number;
     try {
-      messageId = await deps.send(r.chat_id, buildReminderMessage(r.text));
+      messageId = await deps.send(
+        r.chat_id,
+        buildReminderMessage(r.text, isNag ? { index, total } : undefined),
+        isNag ? buildDoneKeyboard(r.id) : undefined,
+      );
     } catch (err) {
       failed++;
       // В лог пишем id и причину, но НЕ текст напоминания: он может быть личным.
@@ -57,14 +85,43 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
       continue;
     }
 
-    // Сообщение УЖЕ ушло. Если отметить «отправлено» не вышло, повторяем один раз;
-    // возвращать в очередь нельзя, иначе человек получит напоминание дважды.
     sent++;
+
+    // У предыдущего сообщения серии убираем кнопку «Готово»: она остаётся только у самого
+    // свежего. Делаем это ПОСЛЕ успешной отправки (если бы отправка упала, у человека
+    // осталась бы рабочая кнопка) и не считаем сбой критичным: это только косметика.
+    if (isNag && r.last_message_id && deps.clearKeyboard) {
+      try {
+        await deps.clearKeyboard(r.chat_id, r.last_message_id);
+      } catch (err) {
+        log(
+          `Не удалось убрать кнопку у сообщения серии ${r.id}: ${
+            errorMessage(err)
+          }`,
+        );
+      }
+    }
+
+    // Что записать в базу. Для серии: счётчик и, если это не последнее сообщение, время
+    // следующего. Считаем его от «сейчас», а не от старого срока: после сбоя tick не должен
+    // присылать накопившиеся повторы пачкой.
+    const next: { nagSent?: number; nextRemindAt?: Date } = {};
+    if (isNag) {
+      next.nagSent = index;
+      if (index < total) {
+        const now = (deps.now ?? (() => new Date()))();
+        next.nextRemindAt = new Date(now.getTime() + interval * 60_000);
+      }
+    }
+
+    // Сообщение УЖЕ ушло. Если отметить не вышло, повторяем один раз; возвращать в очередь
+    // нельзя, иначе человек получит напоминание дважды. Ответ false означает, что пользователь
+    // успел нажать «Готово»/🗑 — это штатно, его решение главнее, повтор не возобновляем.
     try {
-      await deps.store.markReminderSent(r.id, messageId);
+      await deps.store.markReminderSent(r.id, messageId, next);
     } catch {
       try {
-        await deps.store.markReminderSent(r.id, messageId);
+        await deps.store.markReminderSent(r.id, messageId, next);
       } catch (err) {
         log(`Отправили ${r.id}, но не смогли отметить: ${errorMessage(err)}`);
       }

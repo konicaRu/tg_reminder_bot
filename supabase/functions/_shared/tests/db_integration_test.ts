@@ -24,6 +24,7 @@ import {
   markReminderSent,
   releaseReminder,
   setSession,
+  stopReminder,
 } from "../db.ts";
 
 // Без флага --allow-env читать переменные нельзя (Deno защищает от этого по умолчанию),
@@ -221,4 +222,142 @@ dbTest("сессии: записать, прочитать, заменить, о
   assertEquals((await getSession(db, CHAT))?.state, "awaiting_time");
   await clearSession(db, CHAT);
   assertEquals(await getSession(db, CHAT), null);
+});
+
+// --- «Настойчивое» напоминание (повтор до «Готово») ---------------------------------
+
+dbTest("nag: параметры серии сохраняются при создании", async (db) => {
+  const r = await createReminder(db, {
+    chat_id: CHAT,
+    text: "лекарство",
+    remind_at: FUTURE(),
+    nag: { intervalMin: 5, total: 10 },
+  });
+  assertEquals([r.nag_interval_min, r.nag_total, r.nag_sent], [5, 10, 0]);
+});
+
+dbTest("nag: без повтора поля пустые, nag_sent = 0", async (db) => {
+  const r = await createReminder(db, {
+    chat_id: CHAT,
+    text: "обычное",
+    remind_at: FUTURE(),
+  });
+  assertEquals([r.nag_interval_min, r.nag_total, r.nag_sent], [null, null, 0]);
+});
+
+dbTest(
+  "nag: база не принимает неверные значения (защита от спама)",
+  async (db) => {
+    const bad = [
+      { nag: { intervalMin: 0, total: 10 } }, // интервал меньше минуты
+      { nag: { intervalMin: 5, total: 1 } }, // в серии меньше двух
+      { nag: { intervalMin: 5, total: 51 } }, // больше 50
+      { nag: { intervalMin: 5000, total: 10 } }, // больше суток
+    ];
+    for (const b of bad) {
+      let threw = false;
+      try {
+        await createReminder(db, {
+          chat_id: CHAT,
+          text: "x",
+          remind_at: FUTURE(),
+          ...b,
+        });
+      } catch {
+        threw = true;
+      }
+      assertEquals(threw, true);
+    }
+  },
+);
+
+dbTest(
+  "nag: после отправки не последнего сообщения напоминание возвращается в очередь на новое время",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "серия",
+      remind_at: PAST(),
+      nag: { intervalMin: 5, total: 3 },
+    });
+    await claimDueReminders(db);
+    const next = FUTURE();
+    const updated = await markReminderSent(db, r.id, 111, {
+      nagSent: 1,
+      nextRemindAt: next,
+    });
+    assertEquals(updated, true);
+    const { data } = await db.from("reminders").select(
+      "status, nag_sent, last_message_id, remind_at",
+    )
+      .eq("id", r.id).single();
+    assertEquals(data!.status, "pending");
+    assertEquals(data!.nag_sent, 1);
+    assertEquals(data!.last_message_id, 111);
+    assertEquals(new Date(data!.remind_at).getTime(), next.getTime());
+  },
+);
+
+dbTest("nag: последнее сообщение серии → статус sent", async (db) => {
+  const r = await createReminder(db, {
+    chat_id: CHAT,
+    text: "серия",
+    remind_at: PAST(),
+    nag: { intervalMin: 5, total: 2 },
+  });
+  await claimDueReminders(db);
+  await markReminderSent(db, r.id, 222, { nagSent: 2 });
+  const { data } = await db.from("reminders").select("status, nag_sent").eq(
+    "id",
+    r.id,
+  ).single();
+  assertEquals(data, { status: "sent", nag_sent: 2 });
+});
+
+dbTest(
+  "«Готово» выигрывает у tick: нажали, пока шла отправка → повтор не возобновляется",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "серия",
+      remind_at: PAST(),
+      nag: { intervalMin: 5, total: 5 },
+    });
+    await claimDueReminders(db); // tick взял запись: статус sending
+    const stopped = await stopReminder(db, CHAT, r.id); // пользователь нажал «Готово»
+    assertEquals(stopped, { text: "серия" });
+    // tick заканчивает отправку и пытается вернуть запись в очередь, но статус уже не sending
+    const updated = await markReminderSent(db, r.id, 333, {
+      nagSent: 1,
+      nextRemindAt: FUTURE(),
+    });
+    assertEquals(updated, false);
+    const { data } = await db.from("reminders").select("status").eq("id", r.id)
+      .single();
+    assertEquals(data!.status, "done");
+  },
+);
+
+dbTest(
+  "stopReminder: свой чат — да, чужой — нет, повторно — null",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "стоп",
+      remind_at: FUTURE(),
+    });
+    assertEquals(await stopReminder(db, CHAT - 1, r.id), null); // чужой чат
+    assertEquals(await stopReminder(db, CHAT, r.id), { text: "стоп" });
+    assertEquals(await stopReminder(db, CHAT, r.id), null); // уже остановлено
+  },
+);
+
+dbTest("stopReminder: отменённое (cancelled) не воскрешается", async (db) => {
+  const r = await createReminder(db, {
+    chat_id: CHAT,
+    text: "удалено",
+    remind_at: FUTURE(),
+  });
+  await cancelReminder(db, CHAT, r.id);
+  assertEquals(await stopReminder(db, CHAT, r.id), null);
 });

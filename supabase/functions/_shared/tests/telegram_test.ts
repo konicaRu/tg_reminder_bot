@@ -5,9 +5,12 @@
 import { deepStrictEqual as assertEquals } from "node:assert";
 import {
   buildConfirmCard,
+  buildDoneKeyboard,
   buildListMessage,
   buildReminderMessage,
+  buildStoppedMessage,
   decodeCallback,
+  DEFAULT_NAG,
   encodeCallback,
   escapeHtml,
   formatWhen,
@@ -101,10 +104,14 @@ Deno.test("карточка: текст и две кнопки [OK] [Друго�
     now: NOW,
   });
   assertEquals(card.text, "Напомню <b>29.10 в 11:00</b>: встреча");
-  assertEquals(card.reply_markup.inline_keyboard, [[
-    { text: "✅ OK", callback_data: "ok:a1b2c3d4" },
-    { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
-  ]]);
+  assertEquals(card.reply_markup.inline_keyboard, [
+    [
+      { text: "✅ OK", callback_data: "ok:a1b2c3d4" },
+      { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
+    ],
+    // второй ряд: включить повторные напоминания
+    [{ text: "🔁 Повторять", callback_data: "rep:a1b2c3d4" }],
+  ]);
 });
 
 Deno.test("карточка: текст пользователя экранируется", () => {
@@ -192,5 +199,186 @@ Deno.test("сообщение-напоминание: заголовок и те
   assertEquals(
     buildReminderMessage("a < b"),
     "⏰ <b>Напоминание</b>\na &lt; b",
+  );
+});
+
+// =============================================================================
+// «Настойчивое» напоминание: повторять каждые N минут, всего M раз, пока не «Готово»
+// =============================================================================
+
+Deno.test("настойчивое: значения по умолчанию — каждые 5 минут, всего 10 раз", () => {
+  assertEquals(DEFAULT_NAG, { intervalMin: 5, total: 10 });
+});
+
+// --- Данные кнопок с числом (интервал, количество) ---------------------------
+
+Deno.test("callback: действия с числом кодируются и разбираются", () => {
+  assertEquals(
+    encodeCallback({ action: "ivl", id: "a1b2c3d4", arg: 30 }),
+    "ivl:a1b2c3d4:30",
+  );
+  assertEquals(decodeCallback("ivl:a1b2c3d4:30"), {
+    action: "ivl",
+    id: "a1b2c3d4",
+    arg: 30,
+  });
+  assertEquals(decodeCallback("cnt:a1b2c3d4:10"), {
+    action: "cnt",
+    id: "a1b2c3d4",
+    arg: 10,
+  });
+});
+
+Deno.test("callback: rep и done — без числа", () => {
+  assertEquals(decodeCallback("rep:a1b2c3d4"), {
+    action: "rep",
+    id: "a1b2c3d4",
+  });
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  assertEquals(decodeCallback(`done:${uuid}`), { action: "done", id: uuid });
+  assertEquals(new TextEncoder().encode(`done:${uuid}`).length <= 64, true);
+});
+
+Deno.test("callback: число обязательно там, где нужно, и запрещено там, где не нужно", () => {
+  assertEquals(decodeCallback("ivl:a1b2c3d4"), null); // нет числа
+  assertEquals(decodeCallback("cnt:a1b2c3d4:"), null);
+  assertEquals(decodeCallback("ivl:a1b2c3d4:abc"), null); // не число
+  assertEquals(decodeCallback("ivl:a1b2c3d4:-5"), null);
+  assertEquals(decodeCallback("ok:a1b2c3d4:5"), null); // лишнее число
+  assertEquals(decodeCallback("rep:a1b2c3d4:1"), null);
+});
+
+// --- Карточка с включённым повтором ------------------------------------------
+
+const cardWithNag = (nag: { intervalMin: number; total: number }) =>
+  buildConfirmCard({
+    text: "принять лекарство",
+    remindAt: new Date("2026-10-29T08:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+    nag,
+  });
+
+Deno.test("карточка с повтором: пояснение в тексте", () => {
+  const card = cardWithNag({ intervalMin: 5, total: 10 });
+  assertEquals(
+    card.text,
+    "Напомню <b>29.10 в 11:00</b>: принять лекарство\n" +
+      "🔁 Повторю каждые 5 мин, всего 10 раз, пока не нажмёшь «Готово»",
+  );
+});
+
+Deno.test("карточка с повтором: кнопки OK/Другое время, «Выключить повтор», интервалы и количество с отметкой выбранного", () => {
+  const card = cardWithNag({ intervalMin: 5, total: 10 });
+  assertEquals(card.reply_markup.inline_keyboard, [
+    [
+      { text: "✅ OK", callback_data: "ok:a1b2c3d4" },
+      { text: "🕐 Другое время", callback_data: "other:a1b2c3d4" },
+    ],
+    [{ text: "🔁 Выключить повтор", callback_data: "rep:a1b2c3d4" }],
+    [
+      { text: "5 мин ✓", callback_data: "ivl:a1b2c3d4:5" },
+      { text: "10 мин", callback_data: "ivl:a1b2c3d4:10" },
+      { text: "30 мин", callback_data: "ivl:a1b2c3d4:30" },
+      { text: "1 час", callback_data: "ivl:a1b2c3d4:60" },
+    ],
+    [
+      { text: "×3", callback_data: "cnt:a1b2c3d4:3" },
+      { text: "×5", callback_data: "cnt:a1b2c3d4:5" },
+      { text: "×10 ✓", callback_data: "cnt:a1b2c3d4:10" },
+      { text: "×20", callback_data: "cnt:a1b2c3d4:20" },
+    ],
+  ]);
+});
+
+Deno.test("карточка с повтором: отметка ✓ следует за выбором, склонение «раза/раз», «1 час»", () => {
+  const card = cardWithNag({ intervalMin: 60, total: 3 });
+  assertEquals(
+    card.text.endsWith(
+      "🔁 Повторю каждые 1 час, всего 3 раза, пока не нажмёшь «Готово»",
+    ),
+    true,
+  );
+  const rows = card.reply_markup.inline_keyboard;
+  assertEquals(rows[2].map((b) => b.text), [
+    "5 мин",
+    "10 мин",
+    "30 мин",
+    "1 час ✓",
+  ]);
+  assertEquals(rows[3].map((b) => b.text), ["×3 ✓", "×5", "×10", "×20"]);
+});
+
+Deno.test("карточка: все кнопки укладываются в лимит callback_data (64 байта)", () => {
+  const card = buildConfirmCard({
+    text: "x",
+    remindAt: new Date("2026-10-29T08:00:00Z"),
+    draftId: "abcdefgh",
+    timezone: TZ,
+    now: NOW,
+    nag: { intervalMin: 5, total: 10 },
+  });
+  for (const b of card.reply_markup.inline_keyboard.flat()) {
+    assertEquals(new TextEncoder().encode(b.callback_data).length <= 64, true);
+  }
+});
+
+// --- Сообщение-повтор и кнопка «Готово» --------------------------------------
+
+Deno.test("сообщение серии: «(k из N)» в заголовке", () => {
+  assertEquals(
+    buildReminderMessage("принять лекарство", { index: 2, total: 10 }),
+    "⏰ <b>Напоминание</b> (2 из 10)\nпринять лекарство",
+  );
+  // без серии — как раньше
+  assertEquals(
+    buildReminderMessage("встреча"),
+    "⏰ <b>Напоминание</b>\nвстреча",
+  );
+});
+
+Deno.test("кнопка «Готово» несёт id напоминания", () => {
+  assertEquals(buildDoneKeyboard("rem-1"), {
+    inline_keyboard: [[{ text: "✅ Готово", callback_data: "done:rem-1" }]],
+  });
+});
+
+Deno.test("после «Готово» сообщение превращается в «✅ Готово» с текстом (экранированным)", () => {
+  assertEquals(buildStoppedMessage("a < b"), "✅ <b>Готово</b>\na &lt; b");
+});
+
+// --- /list: отметка серии ----------------------------------------------------
+
+Deno.test("список: у напоминания с повтором есть отметка 🔁 и счётчик отправленных", () => {
+  const msg = buildListMessage(
+    [
+      { id: "id-1", text: "обычное", remind_at: "2026-10-29T08:00:00Z" },
+      {
+        id: "id-2",
+        text: "лекарство",
+        remind_at: "2026-10-29T09:00:00Z",
+        nag_interval_min: 5,
+        nag_total: 10,
+        nag_sent: 0,
+      },
+      {
+        id: "id-3",
+        text: "вода",
+        remind_at: "2026-10-29T10:00:00Z",
+        nag_interval_min: 60,
+        nag_total: 3,
+        nag_sent: 2,
+      },
+    ],
+    TZ,
+    NOW,
+  );
+  assertEquals(
+    msg.text,
+    "Твои напоминания:\n" +
+      "1. 29.10 в 11:00 — обычное\n" +
+      "2. 29.10 в 12:00 — лекарство 🔁 каждые 5 мин ×10\n" +
+      "3. 29.10 в 13:00 — вода 🔁 каждые 1 час ×3 (отправлено 2)",
   );
 });
