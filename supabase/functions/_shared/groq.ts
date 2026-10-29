@@ -10,6 +10,7 @@ import type {
   ParseResult,
 } from "./parser/mod.ts";
 import { localParts, offsetString } from "./parser/tz.ts";
+import { buildRrule, nextOccurrence, parseRrule } from "./repeat.ts";
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const TIMEOUT_MS = 8000; // дольше ждать нет смысла: пользователь ждёт карточку
@@ -46,7 +47,7 @@ function buildSystemPrompt(opts: ParseOptions): string {
     'Верни ТОЛЬКО JSON-объект вида {"text": строка, "remind_at": строка, "rrule": null, "confidence": число}.',
     "- text: о чём напомнить, без указания даты и времени, на языке пользователя.",
     `- remind_at: момент напоминания в формате ISO 8601 со смещением пояса пользователя (${offset}), например 2026-10-29T11:00:00${offset}. Только в будущем.`,
-    "- rrule: если фраза просит повтор («каждый…», «по будням»), строка RRULE по RFC 5545, иначе null.",
+    '- rrule: если фраза просит повтор каждый день или по дням недели, строка RRULE со временем, например "FREQ=DAILY;BYHOUR=9;BYMINUTE=0" или "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0". Других видов повторов (раз в N недель, месяц, год) не бывает: тогда верни то, что просит фраза, в том же формате. Если повтора нет, null.',
     "- confidence: число от 0 до 1, насколько ты уверен в разборе. Если в фразе нет даты или времени, поставь 0.",
     `- Если время не указано, используй ${opts.defaultTime}.`,
     `Пояс пользователя: ${tz} (UTC${offset}). Сейчас у пользователя: ${localIso}, ${weekday}.`,
@@ -125,12 +126,27 @@ export async function parseWithLlm(
   }
   if (confidence < MIN_CONFIDENCE) return fail("llm_invalid");
 
-  // Повторы — фаза 2: пока честно отказываем, а не сохраняем «разовое» вместо «каждый день».
+  const cleanText = text.trim();
+
+  // Повтор: принимаем только то, что умеем (каждый день / дни недели). Остальное честно
+  // отклоняем, а не сохраняем «разовое» вместо «каждый месяц». Строку приводим к нашему
+  // виду, а первое срабатывание считаем сами (дате от модели в повторе не доверяем).
   if (typeof rrule === "string" && rrule.trim() !== "") {
-    return fail("repeat_unsupported");
+    const rule = parseRrule(rrule.trim());
+    if (!rule) return fail("repeat_unsupported");
+    if (!cleanText) return fail("empty_text");
+    const normalized = buildRrule(rule);
+    const first = nextOccurrence(normalized, opts.now, opts.timezone);
+    if (!first) return fail("repeat_unsupported");
+    return {
+      ok: true,
+      text: cleanText,
+      remindAt: first,
+      rrule: normalized,
+      confidence,
+    };
   }
 
-  const cleanText = text.trim();
   if (!cleanText) return fail("empty_text");
 
   // 4. Проверяем дату: с поясом, читается, в будущем.

@@ -216,10 +216,141 @@ const FAIL_CASES: FailCase[] = [
   { input: "завтра в 9 утра", fail: "empty_text" },
   // даты нет вообще
   { input: "купить молоко", fail: "no_date" },
-  // повторы — это фаза 2, пока честно говорим «не поддерживается»
-  { input: "каждый день в 9 зарядка", fail: "repeat_unsupported" },
-  { input: "каждый понедельник в 10 планёрка", fail: "repeat_unsupported" },
+  // повторы, которые пока не умеем (только каждый день и дни недели), честно говорим «не поддерживается»
+  { input: "каждые 2 недели в 9 отчёт", fail: "repeat_unsupported" },
+  { input: "каждый месяц 15 числа оплата", fail: "repeat_unsupported" },
+  { input: "каждый год 3 ноября поздравить", fail: "repeat_unsupported" },
+  // повтор есть, а о чём напомнить — нет
+  { input: "каждый день в 9", fail: "empty_text" },
 ];
+
+// Повторы по расписанию: ожидаемые текст, строка RRULE и первое срабатывание.
+type RepeatCase = { input: string; text: string; rrule: string; at: string };
+const D9 = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0";
+const WD = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR";
+const REPEAT_CASES: RepeatCase[] = [
+  {
+    input: "каждый день в 9 зарядка",
+    text: "зарядка",
+    rrule: D9,
+    at: "2026-10-29T06:00:00Z",
+  },
+  {
+    input: "каждый понедельник в 10 планёрка",
+    text: "планёрка",
+    rrule: "FREQ=WEEKLY;BYDAY=MO;BYHOUR=10;BYMINUTE=0",
+    at: "2026-11-02T07:00:00Z",
+  },
+  {
+    input: "каждый будний день в 9 зарядка",
+    text: "зарядка",
+    rrule: `${WD};BYHOUR=9;BYMINUTE=0`,
+    at: "2026-10-29T06:00:00Z",
+  },
+  {
+    input: "по будням в 8:30 стендап",
+    text: "стендап",
+    rrule: `${WD};BYHOUR=8;BYMINUTE=30`,
+    at: "2026-10-29T05:30:00Z",
+  },
+  {
+    input: "по выходным в 11 уборка",
+    text: "уборка",
+    rrule: "FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=11;BYMINUTE=0",
+    at: "2026-10-31T08:00:00Z",
+  },
+  {
+    input: "ежедневно в 22:00 выпить таблетку",
+    text: "выпить таблетку",
+    rrule: "FREQ=DAILY;BYHOUR=22;BYMINUTE=0",
+    at: "2026-10-28T19:00:00Z",
+  },
+  {
+    input: "каждую среду в 18:00 йога",
+    text: "йога",
+    rrule: "FREQ=WEEKLY;BYDAY=WE;BYHOUR=18;BYMINUTE=0",
+    at: "2026-10-28T15:00:00Z",
+  },
+  {
+    input: "каждый вторник и четверг в 19 тренировка",
+    text: "тренировка",
+    rrule: "FREQ=WEEKLY;BYDAY=TU,TH;BYHOUR=19;BYMINUTE=0",
+    at: "2026-10-29T16:00:00Z",
+  },
+  {
+    input: "по понедельникам и средам в 7 зарядка",
+    text: "зарядка",
+    rrule: "FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=7;BYMINUTE=0",
+    at: "2026-11-02T04:00:00Z",
+  },
+  {
+    input: "зарядка каждый день в 9",
+    text: "зарядка",
+    rrule: D9,
+    at: "2026-10-29T06:00:00Z",
+  },
+  {
+    input: "напомни каждый день зарядка",
+    text: "зарядка",
+    rrule: D9,
+    at: "2026-10-29T06:00:00Z",
+  },
+  {
+    input: "каждое воскресенье в 20:00 позвонить маме",
+    text: "позвонить маме",
+    rrule: "FREQ=WEEKLY;BYDAY=SU;BYHOUR=20;BYMINUTE=0",
+    at: "2026-11-01T17:00:00Z",
+  },
+  {
+    input: "каждый день в 8 вечера принять лекарство",
+    text: "принять лекарство",
+    rrule: "FREQ=DAILY;BYHOUR=20;BYMINUTE=0",
+    at: "2026-10-28T17:00:00Z",
+  },
+  {
+    input: "каждое утро зарядка",
+    text: "зарядка",
+    rrule: D9,
+    at: "2026-10-29T06:00:00Z",
+  },
+  {
+    input: "каждый вечер гулять",
+    text: "гулять",
+    rrule: "FREQ=DAILY;BYHOUR=19;BYMINUTE=0",
+    at: "2026-10-28T16:00:00Z",
+  },
+  {
+    input: "каждую пятницу в 17:30 отчёт",
+    text: "отчёт",
+    rrule: "FREQ=WEEKLY;BYDAY=FR;BYHOUR=17;BYMINUTE=30",
+    at: "2026-10-30T14:30:00Z",
+  },
+  {
+    input: "в будние дни в 7 вставать",
+    text: "вставать",
+    rrule: `${WD};BYHOUR=7;BYMINUTE=0`,
+    at: "2026-10-29T04:00:00Z",
+  },
+  {
+    input: "каждые выходные в 10 рынок",
+    text: "рынок",
+    rrule: "FREQ=WEEKLY;BYDAY=SA,SU;BYHOUR=10;BYMINUTE=0",
+    at: "2026-10-31T07:00:00Z",
+  },
+];
+
+for (const c of REPEAT_CASES) {
+  Deno.test(`повтор: «${c.input}»`, () => {
+    const res = parseReminder(c.input, OPTS);
+    if (!res.ok) {
+      throw new Error(`ожидали успех, получили отказ: ${res.reason}`);
+    }
+    assertEquals(res.text, c.text);
+    assertEquals(res.rrule, c.rrule);
+    assertEquals(res.remindAt.toISOString(), new Date(c.at).toISOString());
+    assertEquals(res.adjusted, undefined);
+  });
+}
 
 for (const c of OK_CASES) {
   Deno.test(`разбор: «${c.input}»`, () => {

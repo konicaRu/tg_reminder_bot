@@ -157,16 +157,41 @@ Deno.test("Groq: пустой текст напоминания → empty_text",
   assertEquals(res, { ok: false, reason: "empty_text" });
 });
 
-Deno.test("Groq: модель вернула повтор (rrule) → repeat_unsupported (фаза 2)", async () => {
+Deno.test("Groq: поддержанный повтор (по будням) принимаем: строка нормализуется, первое срабатывание считаем сами", async () => {
   const repeat = JSON.stringify({
     text: "зарядка",
     remind_at: "2026-10-29T09:00:00+03:00",
-    rrule: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR",
+    rrule: "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9",
     confidence: 0.95,
   });
   const { fetchFn } = fakeGroq(repeat);
   const res = await parseWithLlm("по будням зарядка", OPTS, cfg(fetchFn));
-  assertEquals(res, { ok: false, reason: "repeat_unsupported" });
+  if (!res.ok) throw new Error(res.reason);
+  assertEquals(
+    res.rrule,
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0",
+  );
+  assertEquals(res.remindAt.toISOString(), "2026-10-29T06:00:00.000Z");
+});
+
+Deno.test("Groq: повтор, который не умеем (раз в месяц, интервал), → repeat_unsupported", async () => {
+  for (
+    const rrule of [
+      "FREQ=MONTHLY;BYMONTHDAY=15;BYHOUR=9",
+      "FREQ=DAILY;INTERVAL=2;BYHOUR=9",
+      "мусор",
+    ]
+  ) {
+    const repeat = JSON.stringify({
+      text: "оплата",
+      remind_at: "2026-11-15T09:00:00+03:00",
+      rrule,
+      confidence: 0.95,
+    });
+    const { fetchFn } = fakeGroq(repeat);
+    const res = await parseWithLlm("оплата", OPTS, cfg(fetchFn));
+    assertEquals(res, { ok: false, reason: "repeat_unsupported" });
+  }
 });
 
 Deno.test("Groq: ошибка сервера (HTTP 500) → llm_unavailable", async () => {

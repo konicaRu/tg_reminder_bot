@@ -14,6 +14,7 @@ import {
   weekdayOf,
   zonedToUtc,
 } from "./tz.ts";
+import { buildRrule, nextOccurrence } from "../repeat.ts";
 
 export type ParseFailReason =
   | "no_date"
@@ -33,7 +34,7 @@ export type ParseResult =
     ok: true;
     text: string;
     remindAt: Date; // момент срабатывания (UTC)
-    rrule: string | null; // в фазе 1 всегда null
+    rrule: string | null; // строка RRULE для повторяющегося напоминания, иначе null
     confidence: number; // 0..1
     adjusted?: "tomorrow"; // время сегодня уже прошло — перенесли на завтра
   }
@@ -75,6 +76,77 @@ const REPEAT_RE = new RegExp(
   `${NB}(?:кажд\\p{L}*|ежедневн\\p{L}*|еженедельн\\p{L}*|по\\s+(?:будням|выходным))${NA}`,
   "iu",
 );
+
+// --- Повторы по расписанию ---------------------------------------------------
+const DAY_STEM = "понедельник|вторник|сред|четверг|пятниц|суббот|воскресень";
+// «каждый день», «ежедневно»
+const EVERY_DAY_RE = new RegExp(
+  String.raw`${NB}(?:ежедневн\p{L}*|кажд\p{L}*\s+(?:день|дн\p{L}*))${NA}`,
+  "iu",
+);
+// «каждое утро» / «каждый вечер»: каждый день, а время по умолчанию подсказывает слово
+const EVERY_MORNING_RE = new RegExp(
+  String.raw`${NB}каждое\s+утро${NA}`,
+  "iu",
+);
+const EVERY_EVENING_RE = new RegExp(
+  String.raw`${NB}кажд\p{L}*\s+вечер${NA}`,
+  "iu",
+);
+// «по будням», «каждый будний день», «в будние дни»
+const WEEKDAYS_RE = new RegExp(
+  String
+    .raw`${NB}(?:по|в|кажд\p{L}*)\s+будн\p{L}*(?:\s+(?:день|дн\p{L}*))?${NA}`,
+  "iu",
+);
+// «по выходным», «каждые выходные», «в выходные дни»
+const WEEKEND_RE = new RegExp(
+  String
+    .raw`${NB}(?:по|в|кажд\p{L}*)\s+выходн\p{L}*(?:\s+(?:день|дн\p{L}*))?${NA}`,
+  "iu",
+);
+// «каждый понедельник», «по средам», «каждый вторник и четверг», «по пн…» не поддерживаем
+const WEEKDAY_LIST_RE = new RegExp(
+  String
+    .raw`${NB}(?:по|кажд\p{L}*)\s+(?:${DAY_STEM})\p{L}*(?:\s*(?:,|и)\s*(?:${DAY_STEM})\p{L}*)*${NA}`,
+  "iu",
+);
+const DAY_STEM_G = new RegExp(`${NB}(${DAY_STEM})`, "giu");
+
+// Что нашли в фразе: дни недели ([] = каждый день), время по умолчанию из слова
+// («вечер» → 19:00) и фраза без повтора.
+type RepeatFound = {
+  days: number[];
+  defaultTime?: string;
+  rest: string;
+};
+
+// Ищет в строке описание повтора. null — повтора в фразе нет; "unsupported" — слово
+// «каждый…» есть, но такой повтор (раз в N недель, месяц, год…) мы пока не умеем.
+function extractRepeat(s: string): RepeatFound | "unsupported" | null {
+  const cut = (re: RegExp) => {
+    const m = re.exec(s);
+    return m
+      ? { m, rest: s.slice(0, m.index) + " " + s.slice(m.index + m[0].length) }
+      : null;
+  };
+  let r;
+  if ((r = cut(WEEKDAYS_RE))) return { days: [1, 2, 3, 4, 5], rest: r.rest };
+  if ((r = cut(WEEKEND_RE))) return { days: [0, 6], rest: r.rest };
+  if ((r = cut(WEEKDAY_LIST_RE))) {
+    const days = [...r.m[0].matchAll(DAY_STEM_G)].map((x) =>
+      WEEKDAY_STEMS.findIndex((stem) => x[1].toLowerCase().startsWith(stem))
+    );
+    return { days, rest: r.rest };
+  }
+  if ((r = cut(EVERY_DAY_RE))) return { days: [], rest: r.rest };
+  if ((r = cut(EVERY_MORNING_RE))) return { days: [], rest: r.rest };
+  if ((r = cut(EVERY_EVENING_RE))) {
+    return { days: [], defaultTime: "19:00", rest: r.rest };
+  }
+  return REPEAT_RE.test(s) ? "unsupported" : null;
+}
+
 // «напомни», «напомни мне» в начале фразы — служебные слова, в текст не идут.
 const FILLER_RE =
   /^(?:напомни(?:те)?|напоминай(?:те)?)(?![\p{L}])(?:\s+мне(?![\p{L}]))?[\s,:-]*/iu;
@@ -112,10 +184,13 @@ export function parseReminder(input: string, opts: ParseOptions): ParseResult {
   const { now, timezone: tz } = opts;
   let s = input.replace(/\s+/g, " ").trim();
 
-  // Повторы («каждый день…») — задача фазы 2. Пока честно отказываем.
-  if (REPEAT_RE.test(s)) return { ok: false, reason: "repeat_unsupported" };
-
   s = s.replace(FILLER_RE, "");
+
+  // Повторы по расписанию («каждый день в 9», «по будням», «каждый вторник и четверг»).
+  const repeat = extractRepeat(s);
+  if (repeat === "unsupported") {
+    return { ok: false, reason: "repeat_unsupported" };
+  }
 
   // Вырезает первое совпадение из строки s и возвращает его.
   const take = (re: RegExp): RegExpExecArray | null => {
@@ -128,6 +203,46 @@ export function parseReminder(input: string, opts: ParseOptions): ParseResult {
 
   const local = localParts(now, tz);
   const today: LocalDate = { y: local.y, m: local.m, d: local.d };
+
+  if (repeat) {
+    s = repeat.rest;
+    // Время: «в 9», «в 18:30», «в 8 вечера»; иначе по умолчанию. Для повтора час берём
+    // как написан (без угадывания «5 или 17»): карточка подтверждения покажет результат.
+    let hour: number;
+    let minute: number;
+    const backup = s;
+    const t = take(TIME_COLON_RE) ?? take(TIME_HOUR_RE);
+    const hasMinutes = t !== null && t[2] !== undefined && /^\d/.test(t[2]);
+    const h = t ? +t[1] : NaN;
+    const mi = t ? (hasMinutes ? +t[2] : 0) : 0;
+    if (t && h <= 23 && mi <= 59) {
+      hour = h;
+      minute = mi;
+      const period = (hasMinutes ? t[3] : t[2])?.toLowerCase();
+      if (period) {
+        if (/^утр/.test(period)) {
+          if (hour === 12) hour = 0;
+        } else if (/^(дн|веч)/.test(period)) {
+          if (hour < 12) hour += 12;
+        } else if (/^ноч/.test(period)) {
+          if (hour === 12) hour = 0;
+          else if (hour >= 6 && hour < 12) hour += 12;
+        }
+      }
+    } else {
+      s = backup; // не похоже на время — оставляем в тексте
+      const [dh, dmi] = (repeat.defaultTime ?? opts.defaultTime).split(":")
+        .map(Number);
+      hour = dh;
+      minute = dmi;
+    }
+    const text = cleanText();
+    if (!text) return { ok: false, reason: "empty_text" };
+    const rrule = buildRrule({ days: repeat.days, hour, minute });
+    const remindAt = nextOccurrence(rrule, now, tz);
+    if (!remindAt) return { ok: false, reason: "repeat_unsupported" };
+    return { ok: true, text, remindAt, rrule, confidence: 0.9 };
+  }
 
   // 1. «через N минут/часов/дней/недель», «через полчаса»
   let relMinutes: number | null = null;
