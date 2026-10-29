@@ -61,7 +61,7 @@ pg_cron (каждую минуту) ──► Edge Function `tick` → отпр�
 - Список секретов: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`.
 - Функция `bot` деплоится с `--no-verify-jwt` (Telegram не умеет слать JWT Supabase), поэтому обязательно проверяет заголовок `X-Telegram-Bot-Api-Secret-Token`.
 - Функция `tick` проверяет свой секрет `TICK_SECRET`.
-- Whitelist: на сообщения не от `ALLOWED_USER_ID` бот не отвечает.
+- Whitelist: на сообщения не от людей из `ALLOWED_USER_ID` (один id или несколько через запятую) бот не отвечает.
 
 ## Правила разбора дат
 1. Сначала **правила** (быстро, бесплатно): «сегодня/завтра/послезавтра», «через N минут/часов/дней», «в 11», «в 11:30», «3 октября», «3.10», дни недели, «каждый день/понедельник/будний день».

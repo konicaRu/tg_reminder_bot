@@ -10,7 +10,7 @@ import {
   createHandlers,
   type Io,
   isAllowed,
-  parseAllowedId,
+  parseAllowedIds,
   type Store,
 } from "../handlers.ts";
 
@@ -153,23 +153,63 @@ function buttonData(sent: Sent[], label: string): string {
 
 // --- Whitelist ---------------------------------------------------------------
 
-Deno.test("whitelist: пускаем только владельца", () => {
-  assertEquals(isAllowed(CHAT, CHAT), true);
-  assertEquals(isAllowed(111, CHAT), false);
-  assertEquals(isAllowed(undefined, CHAT), false);
+Deno.test("whitelist: пускаем только тех, кто в списке", () => {
+  assertEquals(isAllowed(CHAT, [CHAT]), true);
+  assertEquals(isAllowed(111, [CHAT]), false);
+  assertEquals(isAllowed(undefined, [CHAT]), false);
+  // несколько человек (семья)
+  assertEquals(isAllowed(111, [CHAT, 111]), true);
+  assertEquals(isAllowed(222, [CHAT, 111]), false);
+  assertEquals(isAllowed(CHAT, []), false); // пустой список не пускает никого
 });
 
-Deno.test("ALLOWED_USER_ID: число принимаем, мусор и пустое — ошибка (бот не стартует открытым)", () => {
-  assertEquals(parseAllowedId("234320036"), 234320036);
-  for (const bad of [undefined, "", "abc", "0", "-5"]) {
+Deno.test("ALLOWED_USER_ID: один или несколько id через запятую", () => {
+  assertEquals(parseAllowedIds("234320036"), [234320036]);
+  assertEquals(parseAllowedIds("234320036,111222333"), [234320036, 111222333]);
+  assertEquals(parseAllowedIds(" 1 , 2 ,1"), [1, 2]); // пробелы и дубли
+});
+
+Deno.test("ALLOWED_USER_ID: мусор и пустое — ошибка (бот не стартует открытым)", () => {
+  for (
+    const bad of [
+      undefined,
+      "",
+      "  ",
+      "abc",
+      "0",
+      "-5",
+      "1.5",
+      "1,,2",
+      "1,abc",
+      "1,",
+      ",1",
+    ]
+  ) {
     let threw = false;
     try {
-      parseAllowedId(bad);
+      parseAllowedIds(bad);
     } catch {
       threw = true;
     }
-    assertEquals(threw, true);
+    assertEquals(threw, true, `должна быть ошибка для ${JSON.stringify(bad)}`);
   }
+});
+
+Deno.test("несколько человек: чужой не видит, не удаляет и не правит напоминания другого", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  const other: Io = { ...t.io, chatId: CHAT + 1 };
+  await t.h.list(other);
+  assertEquals(t.sent.at(-1)!.text, "Напоминаний пока нет.");
+  await t.h.callback(other, "del:rem-1");
+  await t.h.callback(other, "edit:rem-1");
+  await t.h.callback(other, "done:rem-1");
+  assertEquals(t.reminders[0].status, "pending");
+  assertEquals(
+    t.sent.some((x) => x.kind === "edit" && x.text?.includes("Что изменить")),
+    false,
+  );
 });
 
 // --- /start и /list ----------------------------------------------------------

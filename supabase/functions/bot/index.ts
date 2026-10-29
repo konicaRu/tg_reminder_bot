@@ -30,7 +30,7 @@ import {
   createHandlers,
   type Io,
   isAllowed,
-  parseAllowedId,
+  parseAllowedIds,
   type Store,
 } from "./handlers.ts";
 
@@ -43,8 +43,8 @@ function requireEnv(name: string): string {
 
 const token = requireEnv("TELEGRAM_BOT_TOKEN");
 const webhookSecret = requireEnv("TELEGRAM_WEBHOOK_SECRET");
-// Если ALLOWED_USER_ID кривой, parseAllowedId бросит ошибку: лучше не запуститься, чем пустить всех.
-const allowedUserId = parseAllowedId(Deno.env.get("ALLOWED_USER_ID"));
+// Если ALLOWED_USER_ID кривой, parseAllowedIds бросит ошибку: лучше не запуститься, чем пустить всех.
+const allowedUserIds = parseAllowedIds(Deno.env.get("ALLOWED_USER_ID"));
 
 // Groq необязателен: нет ключа или модели → бот работает только на правилах.
 const groqKey = Deno.env.get("GROQ_API_KEY");
@@ -81,10 +81,12 @@ const handlers = createHandlers({
 const bot = new Bot(token);
 
 // Защита №1 — whitelist. Этот «посредник» (middleware) стоит первым и пропускает дальше
-// только личные сообщения от владельца. Остальным бот не отвечает вообще: для чужих его
+// только личные сообщения от людей из списка. Остальным бот не отвечает вообще: для чужих его
 // как будто не существует.
 bot.use(async (ctx, next) => {
-  if (ctx.chat?.type !== "private" || !isAllowed(ctx.from?.id, allowedUserId)) {
+  if (
+    ctx.chat?.type !== "private" || !isAllowed(ctx.from?.id, allowedUserIds)
+  ) {
     return;
   }
   await next();

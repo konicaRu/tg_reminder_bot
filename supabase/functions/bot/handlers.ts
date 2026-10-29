@@ -88,22 +88,29 @@ export type Deps = {
 
 // --- Безопасность ------------------------------------------------------------
 
-// Whitelist («белый список»): бот отвечает только владельцу.
+// Whitelist («белый список»): бот отвечает только людям из списка (владелец и, например, семья).
 export function isAllowed(
   userId: number | undefined,
-  allowedId: number,
+  allowedIds: number[],
 ): boolean {
-  return userId !== undefined && userId === allowedId;
+  return userId !== undefined && allowedIds.includes(userId);
 }
 
-// ALLOWED_USER_ID приходит из секретов строкой. Если он пустой или кривой, бот не должен
+// ALLOWED_USER_ID приходит из секретов строкой: один id или несколько через запятую
+// («234320036,111222333»). Если там пусто или хоть один элемент кривой, бот не должен
 // запускаться вообще, иначе «белый список» превратится в «пускаем всех».
-export function parseAllowedId(raw: string | undefined): number {
-  const n = Number(raw);
-  if (!raw || !Number.isInteger(n) || n <= 0) {
-    throw new Error("ALLOWED_USER_ID должен быть положительным целым числом");
-  }
-  return n;
+export function parseAllowedIds(raw: string | undefined): number[] {
+  const ids = (raw ?? "").split(",").map((part) => {
+    const trimmed = part.trim();
+    const n = Number(trimmed);
+    if (!trimmed || !Number.isInteger(n) || n <= 0) {
+      throw new Error(
+        "ALLOWED_USER_ID: нужны положительные целые id через запятую",
+      );
+    }
+    return n;
+  });
+  return [...new Set(ids)]; // дубли убираем
 }
 
 // Подсказка при правке текста. Telegram не умеет подставить старый текст в поле ввода,
