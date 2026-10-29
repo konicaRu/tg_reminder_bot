@@ -165,6 +165,43 @@ export async function listPendingReminders(
   ) as Reminder[];
 }
 
+// Одно ожидающее напоминание своего чата (для правки) или null, если его уже нет
+// (сработало, удалено, чужое).
+export async function getReminder(
+  db: Db,
+  chatId: number,
+  id: string,
+): Promise<Reminder | null> {
+  const rows = check(
+    await db.from("reminders").select().eq("id", id).eq("chat_id", chatId)
+      .eq("status", "pending").limit(1),
+    "чтение напоминания",
+  ) as Reminder[] | null;
+  return rows && rows.length > 0 ? rows[0] : null;
+}
+
+// Правка текста и/или времени. Условия защищают: только свои напоминания и только пока
+// статус pending (если tick уже забрал запись, правка не должна её «воскресить»).
+// Смена времени обнуляет счётчик серии повторов: серия начинается заново.
+// Возвращает true, если запись обновилась.
+export async function updateReminder(
+  db: Db,
+  chatId: number,
+  id: string,
+  patch: { text?: string; remind_at?: Date },
+): Promise<boolean> {
+  const rows = check(
+    await db.from("reminders").update({
+      ...(patch.text !== undefined ? { text: patch.text } : {}),
+      ...(patch.remind_at
+        ? { remind_at: patch.remind_at.toISOString(), nag_sent: 0 }
+        : {}),
+    }).eq("id", id).eq("chat_id", chatId).eq("status", "pending").select("id"),
+    "правка напоминания",
+  );
+  return (rows?.length ?? 0) > 0;
+}
+
 // «Удаление» = перевод в статус cancelled. Строка остаётся в базе (история, можно разобраться
 // «куда делось напоминание»), но tick её больше не берёт.
 // Условие chat_id защищает: удалить можно только свои напоминания.

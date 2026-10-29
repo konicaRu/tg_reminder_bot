@@ -21,6 +21,9 @@ export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 //   del   — удалить напоминание из /list  done  — «Готово»: остановить повторы
 //   rep   — включить/выключить повтор     ivl   — выбрать интервал повтора (минуты)
 //   cnt   — выбрать, сколько всего сообщений в серии повторов
+//   edit  — открыть меню правки напоминания из /list
+//   etxt  — править текст     etime — править время
+//   list  — вернуться к списку
 export type CallbackAction =
   | "ok"
   | "other"
@@ -28,7 +31,11 @@ export type CallbackAction =
   | "done"
   | "rep"
   | "ivl"
-  | "cnt";
+  | "cnt"
+  | "edit"
+  | "etxt"
+  | "etime"
+  | "list";
 
 // «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
 // (считая первое), пока пользователь не нажмёт «Готово».
@@ -114,7 +121,10 @@ export function encodeCallback(
 export function decodeCallback(
   data: string,
 ): { action: CallbackAction; id: string; arg?: number } | null {
-  const plain = /^(ok|other|del|done|rep):([A-Za-z0-9_-]{1,60})$/.exec(data);
+  const plain =
+    /^(ok|other|del|done|rep|edit|etxt|etime|list):([A-Za-z0-9_-]{1,60})$/.exec(
+      data,
+    );
   if (plain) return { action: plain[1] as CallbackAction, id: plain[2] };
   const withArg = /^(ivl|cnt):([A-Za-z0-9_-]{1,50}):(\d{1,4})$/.exec(data);
   if (withArg) {
@@ -201,16 +211,48 @@ export function buildListMessage(
     text += `\n\nПоказаны ближайшие ${shown.length} из ${items.length}.`;
   }
 
-  // Под списком — кнопки «🗑 1», «🗑 2»…: номер соответствует строке списка.
-  const buttons: InlineButton[] = shown.map((it, i) => ({
-    text: `🗑 ${i + 1}`,
-    callback_data: encodeCallback({ action: "del", id: it.id }),
-  }));
+  // Под списком — кнопки «✏️ 1»… (править) и «🗑 1»… (удалить): номер = строка списка.
   const rows: InlineButton[][] = [];
-  for (let i = 0; i < buttons.length; i += BUTTONS_PER_ROW) {
-    rows.push(buttons.slice(i, i + BUTTONS_PER_ROW));
+  for (const [icon, action] of [["✏️", "edit"], ["🗑", "del"]] as const) {
+    const buttons: InlineButton[] = shown.map((it, i) => ({
+      text: `${icon} ${i + 1}`,
+      callback_data: encodeCallback({ action, id: it.id }),
+    }));
+    for (let i = 0; i < buttons.length; i += BUTTONS_PER_ROW) {
+      rows.push(buttons.slice(i, i + BUTTONS_PER_ROW));
+    }
   }
   return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+// --- Меню правки одного напоминания ------------------------------------------
+export function buildEditMenu(
+  item: ListItem,
+  tz: string,
+  now: Date,
+): { text: string; reply_markup: InlineKeyboardMarkup } {
+  const when = formatWhen(new Date(item.remind_at), tz, now);
+  return {
+    text: `Что изменить?\n${when} — ${escapeHtml(item.text)}`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "✏️ Текст",
+            callback_data: encodeCallback({ action: "etxt", id: item.id }),
+          },
+          {
+            text: "🕐 Время",
+            callback_data: encodeCallback({ action: "etime", id: item.id }),
+          },
+        ],
+        [{
+          text: "⬅️ К списку",
+          callback_data: encodeCallback({ action: "list", id: "all" }),
+        }],
+      ],
+    },
+  };
 }
 
 // --- Сообщение, когда напоминание сработало ----------------------------------

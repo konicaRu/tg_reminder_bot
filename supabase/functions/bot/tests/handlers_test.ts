@@ -70,6 +70,25 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
       r.status = "done";
       return Promise.resolve({ text: r.text });
     },
+    getReminder: (chatId, id) =>
+      Promise.resolve(
+        reminders.find((x) =>
+          x.id === id && x.chat_id === chatId && x.status === "pending"
+        ) ?? null,
+      ),
+    // правка: только пока напоминание pending (как в db.ts); смена времени обнуляет серию
+    updateReminder: (chatId, id, patch) => {
+      const r = reminders.find((x) =>
+        x.id === id && x.chat_id === chatId && x.status === "pending"
+      );
+      if (!r) return Promise.resolve(false);
+      if (patch.text !== undefined) r.text = patch.text;
+      if (patch.remind_at) {
+        r.remind_at = patch.remind_at.toISOString();
+        r.nag_sent = 0;
+      }
+      return Promise.resolve(true);
+    },
     listPendingReminders: (chatId) =>
       Promise.resolve(
         reminders.filter((r) => r.chat_id === chatId && r.status === "pending"),
@@ -567,5 +586,126 @@ Deno.test("Готово: после остановки серия не пока�
   assertEquals(
     t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
     "Напоминаний пока нет.",
+  );
+});
+
+// --- Правка напоминания из /list ---------------------------------------------
+
+// Создаёт напоминание «завтра в 11 встреча» (29.10 11:00) и открывает меню правки.
+async function withReminder() {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  return t;
+}
+
+Deno.test("правка: ✏️ открывает меню с текущим значением и кнопками", async () => {
+  const t = await withReminder();
+  const menu = t.sent.filter((s) => s.kind === "edit").at(-1)!;
+  assertEquals(menu.text, "Что изменить?\n29.10 в 11:00 — встреча");
+  buttonData(t.sent, "Текст");
+  buttonData(t.sent, "Время");
+  buttonData(t.sent, "К списку");
+});
+
+Deno.test("правка: ✏️ для уже сработавшего/чужого → «Уже сработало», меню нет", async () => {
+  const t = setup();
+  await t.h.callback(t.io, "edit:nonexistent");
+  assertEquals(
+    t.sent.some((s) =>
+      s.kind === "answer" && s.text === "Уже сработало или удалено"
+    ),
+    true,
+  );
+  assertEquals(t.sent.some((s) => s.kind === "edit"), false);
+});
+
+Deno.test("правка текста: следующее сообщение заменяет текст, время не меняется", async () => {
+  const t = await withReminder();
+  const remindAt = t.reminders[0].remind_at;
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  await t.h.text(t.io, "встреча с <Петей>");
+  assertEquals(t.reminders[0].text, "встреча с <Петей>");
+  assertEquals(t.reminders[0].remind_at, remindAt);
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
+    "✅ Обновлено: 29.10 в 11:00 — встреча с &lt;Петей&gt;",
+  );
+  assertEquals(t.sessions.has(CHAT), false); // ожидание закончилось
+  buttonData(t.sent, "К списку");
+});
+
+Deno.test("правка текста: пустой/пробельный текст не принимаем и остаёмся в ожидании", async () => {
+  const t = await withReminder();
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  await t.h.text(t.io, "   ");
+  assertEquals(t.reminders[0].text, "встреча");
+  assertEquals(t.sessions.get(CHAT)?.state, "edit_text");
+});
+
+Deno.test("правка времени: «завтра в 12» меняет время, текст прежний, серия обнуляется", async () => {
+  const t = await withReminder();
+  t.reminders[0].nag_sent = 3;
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "завтра в 12");
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T09:00:00.000Z");
+  assertEquals(t.reminders[0].text, "встреча");
+  assertEquals(t.reminders[0].nag_sent, 0);
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
+    "✅ Обновлено: 29.10 в 12:00 — встреча",
+  );
+  assertEquals(t.sessions.has(CHAT), false);
+});
+
+Deno.test("правка времени: «завтра в 12 новый текст» меняет оба", async () => {
+  const t = await withReminder();
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "завтра в 12 созвон");
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T09:00:00.000Z");
+  assertEquals(t.reminders[0].text, "созвон");
+});
+
+Deno.test("правка времени: не поняли → переспрашиваем, ничего не меняем, ждём дальше", async () => {
+  const t = await withReminder();
+  const before = { ...t.reminders[0] };
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "когда-нибудь");
+  assertEquals(t.reminders[0], before);
+  assertEquals(t.sessions.get(CHAT)?.state, "edit_time");
+});
+
+Deno.test("правка времени: прошедшее сегодня → переносим на завтра и говорим об этом", async () => {
+  const t = await withReminder();
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "сегодня в 10:00"); // сейчас 12:00 по Москве
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T07:00:00.000Z");
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text!.includes("завтра"),
+    true,
+  );
+});
+
+Deno.test("правка: напоминание успело сработать → «Уже сработало», правка не применяется", async () => {
+  const t = await withReminder();
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  t.reminders[0].status = "sent"; // tick опередил
+  await t.h.text(t.io, "новый текст");
+  assertEquals(t.reminders[0].text, "встреча");
+  assertEquals(
+    t.sent.filter((s) => s.kind === "reply").at(-1)!.text,
+    "Это напоминание уже сработало или удалено, изменить нельзя.",
+  );
+  assertEquals(t.sessions.has(CHAT), false);
+});
+
+Deno.test("правка: «К списку» возвращает список", async () => {
+  const t = await withReminder();
+  await t.h.callback(t.io, buttonData(t.sent, "К списку"));
+  assertEquals(
+    t.sent.filter((s) => s.kind === "edit").at(-1)!.text,
+    "Твои напоминания:\n1. 29.10 в 11:00 — встреча",
   );
 });

@@ -17,11 +17,13 @@ import type {
 import type { Reminder, Session, Settings } from "../_shared/db.ts";
 import {
   buildConfirmCard,
+  buildEditMenu,
   buildListMessage,
   buildStoppedMessage,
   decodeCallback,
   DEFAULT_NAG,
   describeNag,
+  encodeCallback,
   escapeHtml,
   formatWhen,
   type InlineKeyboardMarkup,
@@ -55,6 +57,14 @@ export type Store = {
   cancelReminder(chatId: number, id: string): Promise<boolean>;
   // «Готово»: останавливает напоминание и серию; null, если останавливать нечего
   stopReminder(chatId: number, id: string): Promise<{ text: string } | null>;
+  // Правка из /list: одно ожидающее напоминание (null, если уже сработало/удалено/чужое)
+  getReminder(chatId: number, id: string): Promise<Reminder | null>;
+  // false, если править уже нельзя (напоминание успело сработать или удалено)
+  updateReminder(
+    chatId: number,
+    id: string,
+    patch: { text?: string; remind_at?: Date },
+  ): Promise<boolean>;
 };
 
 // «Канал связи» с пользователем в рамках одного события (сообщения или нажатия кнопки).
@@ -109,6 +119,8 @@ const MSG = {
   emptyText: "О чём напомнить? Добавь текст, например: «завтра в 11 встреча».",
   repeat: "Повторяющиеся напоминания пока не умею, это появится позже.\n" +
     "Могу поставить одно: например, «завтра в 9 зарядка».",
+  editGone: "Уже сработало или удалено",
+  editTooLate: "Это напоминание уже сработало или удалено, изменить нельзя.",
   stale: "Эта карточка устарела. Напиши напоминание заново.",
   unsupported:
     "Пока понимаю только текст. Напиши, например: «завтра в 11 встреча».",
@@ -124,6 +136,8 @@ function failureMessage(reason: ParseFailReason): string {
 // --- Состояния диалога (поле state в таблице sessions) ------------------------
 const CONFIRM = "confirm"; // показали карточку, ждём «OK»
 const AWAITING_TIME = "awaiting_time"; // нажали «Другое время», ждём новое время текстом
+const EDIT_TEXT = "edit_text"; // нажали «✏️ Текст» в меню правки, ждём новый текст
+const EDIT_TIME = "edit_time"; // нажали «🕐 Время» в меню правки, ждём новое время
 
 // Черновик напоминания: лежит в sessions.payload до нажатия «OK».
 type Draft = {
@@ -204,6 +218,70 @@ export function createHandlers(deps: Deps) {
     );
   }
 
+  // Список напоминаний (для /list, удаления и кнопки «К списку»).
+  async function listFor(chatId: number) {
+    const settings = await store.getSettings(chatId);
+    const items = await store.listPendingReminders(chatId);
+    return buildListMessage(items, settings.timezone, deps.now());
+  }
+
+  // Применяем правку, которую человек набрал после «✏️ Текст» / «🕐 Время».
+  async function onEdit(
+    io: Io,
+    state: string,
+    payload: Record<string, unknown>,
+    input: string,
+  ): Promise<void> {
+    const id = String(payload.reminderId ?? "");
+    const r = await store.getReminder(io.chatId, id);
+    if (!r) { // успело сработать или удалено
+      await store.clearSession(io.chatId);
+      return io.reply(MSG.editTooLate);
+    }
+    const opts = await parseOptions(io.chatId);
+    const patch: { text?: string; remind_at?: Date } = {};
+    let note = "";
+
+    if (state === EDIT_TEXT) {
+      const text = input.trim();
+      // Пустой текст не принимаем, остаёмся в ожидании.
+      if (!text) return io.reply("Текст не может быть пустым. Напиши ещё раз.");
+      patch.text = text;
+    } else {
+      let res = deps.parse(input, opts);
+      // Прислали только время («завтра в 12») → текст остаётся прежним.
+      if (!res.ok && res.reason === "empty_text") {
+        res = deps.parse(`${input} ${r.text}`, opts);
+      }
+      // Не поняли → остаёмся в ожидании, можно попробовать снова.
+      if (!res.ok) return io.reply(failureMessage(res.reason));
+      patch.remind_at = res.remindAt;
+      if (res.text !== r.text) patch.text = res.text; // время и текст одним сообщением
+      if (res.adjusted === "tomorrow") {
+        note = "Это время сегодня уже прошло, поставил на завтра.\n";
+      }
+    }
+
+    const ok = await store.updateReminder(io.chatId, id, patch);
+    await store.clearSession(io.chatId);
+    if (!ok) return io.reply(MSG.editTooLate);
+
+    const when = formatWhen(
+      patch.remind_at ?? new Date(r.remind_at),
+      opts.timezone,
+      opts.now,
+    );
+    await io.reply(
+      `${note}✅ Обновлено: ${when} — ${escapeHtml(patch.text ?? r.text)}`,
+      {
+        inline_keyboard: [[{
+          text: "📋 К списку",
+          callback_data: encodeCallback({ action: "list", id: "all" }),
+        }]],
+      },
+    );
+  }
+
   return {
     // /start
     start(io: Io): Promise<void> {
@@ -212,9 +290,7 @@ export function createHandlers(deps: Deps) {
 
     // /list
     async list(io: Io): Promise<void> {
-      const settings = await store.getSettings(io.chatId);
-      const items = await store.listPendingReminders(io.chatId);
-      const msg = buildListMessage(items, settings.timezone, deps.now());
+      const msg = await listFor(io.chatId);
       await io.reply(msg.text, msg.reply_markup);
     },
 
@@ -222,6 +298,9 @@ export function createHandlers(deps: Deps) {
     async text(io: Io, input: string): Promise<void> {
       const opts = await parseOptions(io.chatId);
       const session = await store.getSession(io.chatId);
+      if (session?.state === EDIT_TEXT || session?.state === EDIT_TIME) {
+        return onEdit(io, session.state, session.payload, input);
+      }
       if (session?.state === AWAITING_TIME) {
         return onNewTime(io, session.payload, input, opts);
       }
@@ -243,11 +322,46 @@ export function createHandlers(deps: Deps) {
       if (c.action === "del") {
         const removed = await store.cancelReminder(io.chatId, c.id);
         // Обновляем список прямо в том же сообщении, чтобы номера не «разъезжались».
-        const settings = await store.getSettings(io.chatId);
-        const items = await store.listPendingReminders(io.chatId);
-        const msg = buildListMessage(items, settings.timezone, deps.now());
+        const msg = await listFor(io.chatId);
         await io.edit(msg.text, msg.reply_markup);
         return io.answer(removed ? "Удалено" : "Уже удалено");
+      }
+
+      // Правка из /list. Кнопки несут id самого напоминания (как del/done), поэтому
+      // обрабатываем до проверки черновика. Принадлежность чату проверяет store.
+      if (c.action === "list") {
+        // Выходим из ожидания правки, если оно было (черновик карточки не трогаем).
+        const s = await store.getSession(io.chatId);
+        if (s?.state === EDIT_TEXT || s?.state === EDIT_TIME) {
+          await store.clearSession(io.chatId);
+        }
+        const msg = await listFor(io.chatId);
+        await io.edit(msg.text, msg.reply_markup);
+        return io.answer();
+      }
+      if (c.action === "edit" || c.action === "etxt" || c.action === "etime") {
+        const r = await store.getReminder(io.chatId, c.id);
+        if (!r) return io.answer(MSG.editGone);
+        const settings = await store.getSettings(io.chatId);
+        if (c.action === "edit") {
+          const menu = buildEditMenu(r, settings.timezone, deps.now());
+          await io.edit(menu.text, menu.reply_markup);
+          return io.answer();
+        }
+        const isText = c.action === "etxt";
+        await store.setSession(io.chatId, isText ? EDIT_TEXT : EDIT_TIME, {
+          reminderId: r.id,
+        });
+        await io.edit(
+          isText
+            ? `Новый текст для: «${
+              escapeHtml(r.text)
+            }»\nНапиши его одним сообщением.`
+            : `Новое время для: «${escapeHtml(r.text)}»\n` +
+              "Напиши, например, «завтра в 12» или «через час». " +
+              "Можно сразу и новый текст: «завтра в 12 созвон».",
+        );
+        return io.answer();
       }
 
       // «Готово» под сообщением серии: останавливаем напоминание. id здесь — id самого

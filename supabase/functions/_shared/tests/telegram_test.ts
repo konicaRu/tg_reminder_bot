@@ -6,6 +6,7 @@ import { deepStrictEqual as assertEquals } from "node:assert";
 import {
   buildConfirmCard,
   buildDoneKeyboard,
+  buildEditMenu,
   buildListMessage,
   buildReminderMessage,
   buildStoppedMessage,
@@ -168,10 +169,17 @@ Deno.test("список: нумерация, даты в поясе пользо
     msg.text,
     "Твои напоминания:\n1. 29.10 в 11:00 — встреча\n2. 03.11 в 09:00 — позвонить &lt;маме&gt;",
   );
-  assertEquals(msg.reply_markup!.inline_keyboard, [[
-    { text: "🗑 1", callback_data: "del:id-1" },
-    { text: "🗑 2", callback_data: "del:id-2" },
-  ]]);
+  // первый ряд — ✏️ (править), второй — 🗑 (удалить)
+  assertEquals(msg.reply_markup!.inline_keyboard, [
+    [
+      { text: "✏️ 1", callback_data: "edit:id-1" },
+      { text: "✏️ 2", callback_data: "edit:id-2" },
+    ],
+    [
+      { text: "🗑 1", callback_data: "del:id-1" },
+      { text: "🗑 2", callback_data: "del:id-2" },
+    ],
+  ]);
 });
 
 Deno.test("список: больше 20 штук → показываем 20 и предупреждаем", () => {
@@ -183,9 +191,9 @@ Deno.test("список: больше 20 штук → показываем 20 и
   const msg = buildListMessage(many, TZ, NOW);
   assertEquals(msg.text.split("\n").filter((l) => /^\d+\./.test(l)).length, 20);
   assertEquals(msg.text.includes("Показаны ближайшие 20 из 25"), true);
-  // кнопки удаления — по 5 в ряд, всего 20
+  // кнопки ✏️ и 🗑 — по 5 в ряд, каждых по 20
   const rows = msg.reply_markup!.inline_keyboard;
-  assertEquals(rows.flat().length, 20);
+  assertEquals(rows.flat().length, 40);
   assertEquals(rows.every((r) => r.length <= 5), true);
 });
 
@@ -381,4 +389,39 @@ Deno.test("список: у напоминания с повтором есть 
       "2. 29.10 в 12:00 — лекарство 🔁 каждые 5 мин ×10\n" +
       "3. 29.10 в 13:00 — вода 🔁 каждые 1 час ×3 (отправлено 2)",
   );
+});
+
+// --- Редактирование: меню и данные кнопок ------------------------------------
+
+Deno.test("меню правки: что за напоминание и кнопки Текст / Время / К списку", () => {
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  const menu = buildEditMenu(
+    { id: uuid, text: "позвонить <маме>", remind_at: "2026-10-29T08:00:00Z" },
+    TZ,
+    NOW,
+  );
+  assertEquals(
+    menu.text,
+    "Что изменить?\n29.10 в 11:00 — позвонить &lt;маме&gt;",
+  );
+  assertEquals(menu.reply_markup.inline_keyboard, [
+    [
+      { text: "✏️ Текст", callback_data: `etxt:${uuid}` },
+      { text: "🕐 Время", callback_data: `etime:${uuid}` },
+    ],
+    [{ text: "⬅️ К списку", callback_data: "list:all" }],
+  ]);
+  // Telegram принимает callback_data не длиннее 64 байт
+  for (const b of menu.reply_markup.inline_keyboard.flat()) {
+    assertEquals(new TextEncoder().encode(b.callback_data).length <= 64, true);
+  }
+});
+
+Deno.test("callback: новые действия edit / etxt / etime / list разбираются", () => {
+  assertEquals(decodeCallback("edit:abc-1"), { action: "edit", id: "abc-1" });
+  assertEquals(decodeCallback("etxt:abc-1"), { action: "etxt", id: "abc-1" });
+  assertEquals(decodeCallback("etime:abc-1"), { action: "etime", id: "abc-1" });
+  assertEquals(decodeCallback("list:all"), { action: "list", id: "all" });
+  assertEquals(decodeCallback("edit:"), null);
+  assertEquals(decodeCallback("edit:a b"), null);
 });

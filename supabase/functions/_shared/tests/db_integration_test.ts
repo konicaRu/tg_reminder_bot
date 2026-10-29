@@ -18,6 +18,7 @@ import {
   createDb,
   createReminder,
   DEFAULT_SETTINGS,
+  getReminder,
   getSession,
   getSettings,
   listPendingReminders,
@@ -25,6 +26,7 @@ import {
   releaseReminder,
   setSession,
   stopReminder,
+  updateReminder,
 } from "../db.ts";
 
 // Без флага --allow-env читать переменные нельзя (Deno защищает от этого по умолчанию),
@@ -361,3 +363,33 @@ dbTest("stopReminder: отменённое (cancelled) не воскрешает
   await cancelReminder(db, CHAT, r.id);
   assertEquals(await stopReminder(db, CHAT, r.id), null);
 });
+
+dbTest(
+  "updateReminder: меняет текст/время, обнуляет серию; чужой чат и не-pending — нет",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "старый",
+      remind_at: FUTURE(),
+      nag: { intervalMin: 5, total: 3 },
+    });
+    const later = new Date(Date.now() + 2 * 60 * 60 * 1000);
+    assertEquals(
+      await updateReminder(db, CHAT - 1, r.id, { text: "x" }),
+      false,
+    );
+    assertEquals(await updateReminder(db, CHAT, r.id, { text: "новый" }), true);
+    assertEquals(
+      await updateReminder(db, CHAT, r.id, { remind_at: later }),
+      true,
+    );
+    const got = await getReminder(db, CHAT, r.id);
+    assertEquals(got?.text, "новый");
+    assertEquals(new Date(got!.remind_at).getTime(), later.getTime());
+    assertEquals(got?.nag_sent, 0);
+    assertEquals(await getReminder(db, CHAT - 1, r.id), null); // чужой чат
+    await cancelReminder(db, CHAT, r.id);
+    assertEquals(await updateReminder(db, CHAT, r.id, { text: "z" }), false);
+    assertEquals(await getReminder(db, CHAT, r.id), null);
+  },
+);
