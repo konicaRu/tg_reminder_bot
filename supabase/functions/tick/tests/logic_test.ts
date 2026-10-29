@@ -293,8 +293,9 @@ Deno.test("серия: первое сообщение «(1 из 3)» с кно�
   assertEquals(t.marked, [{
     id: "n1",
     messageId: 101,
-    // от момента отправки (NOW), а не от старого срока: после сбоя не будет «пачки» повторов
-    next: { nagSent: 1, nextRemindAt: new Date("2026-10-29T08:05:30Z") },
+    // от момента отправки (NOW), а не от старого срока (после сбоя не будет «пачки» повторов), и округлено
+    // вниз до начала минуты: tick срабатывает ровно в :00, иначе 5 минут превратились бы в 6
+    next: { nagSent: 1, nextRemindAt: new Date("2026-10-29T08:05:00Z") },
   }]);
   assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
 });
@@ -316,7 +317,7 @@ Deno.test("серия: второе сообщение «(2 из 3)»; у пре
   );
   assertEquals(t.marked[0].next, {
     nagSent: 2,
-    nextRemindAt: new Date("2026-10-29T08:10:30Z"),
+    nextRemindAt: new Date("2026-10-29T08:10:00Z"),
   });
   // кнопку у старого сообщения (id 77) убрали, и только когда новое уже ушло (afterSends = 1)
   assertEquals(t.cleared, [{ chatId: 555, messageId: 77, afterSends: 1 }]);

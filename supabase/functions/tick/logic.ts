@@ -110,7 +110,11 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
       next.nagSent = index;
       if (index < total) {
         const now = (deps.now ?? (() => new Date()))();
-        next.nextRemindAt = new Date(now.getTime() + interval * 60_000);
+        // Округляем вниз до начала минуты: tick срабатывает ровно в :00, а отправка идёт на
+        // секунду позже. Без округления время повтора оказалось бы чуть ПОСЛЕ ближайшего
+        // запуска, и 5 минут стабильно превращались бы в 6.
+        const minuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
+        next.nextRemindAt = new Date(minuteStart + interval * 60_000);
       }
     }
 
