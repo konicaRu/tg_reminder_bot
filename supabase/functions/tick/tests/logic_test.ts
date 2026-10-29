@@ -134,6 +134,7 @@ Deno.test("tick: отправляет текст напоминания в ну�
   assertEquals(t.sentMessages, [{
     chatId: 555,
     text: "⏰ <b>Напоминание</b>\nвстреча",
+    markup: doneButton("r1"), // и у обычного напоминания есть snooze и «Готово»
   }]);
   // запомнили id сообщения; у обычного напоминания повторов нет → next пустой
   assertEquals(t.marked, [{ id: "r1", messageId: 101, next: {} }]);
@@ -278,8 +279,16 @@ Deno.test("HTTP: сбой внутри → 500 без подробностей �
 // «Настойчивое» напоминание: серия повторов до «Готово»
 // =============================================================================
 
+// кнопки под любым сработавшим напоминанием: snooze и «Готово»
 const doneButton = (id: string) => ({
-  inline_keyboard: [[{ text: "✅ Готово", callback_data: `done:${id}` }]],
+  inline_keyboard: [
+    [
+      { text: "+10 мин", callback_data: `snz:${id}:10` },
+      { text: "+1 час", callback_data: `snz:${id}:60` },
+      { text: "Завтра", callback_data: `snz:${id}:1440` },
+    ],
+    [{ text: "✅ Готово", callback_data: `done:${id}` }],
+  ],
 });
 
 Deno.test("серия: первое сообщение «(1 из 3)» с кнопкой «Готово»; запись возвращается в очередь на now + интервал", async () => {
@@ -383,6 +392,7 @@ Deno.test("серия вперемешку с обычными: каждое о�
   assertEquals(t.sentMessages[0], {
     chatId: 1,
     text: "⏰ <b>Напоминание</b>\nобычное",
+    markup: doneButton("r1"),
   });
   assertEquals(t.marked[0].next, {}); // обычное → sent
   assertEquals(t.marked[1].next.nagSent, 1); // серия → ещё повторы

@@ -296,6 +296,30 @@ export async function stopReminder(
   return rows && rows.length > 0 ? { text: rows[0].text as string } : null;
 }
 
+// Snooze: переносит сработавшее (или ожидающее) напоминание на новое время.
+// Работает, пока напоминание не отменено и не закрыто «Готово»; серия повторов начинается
+// заново (nag_sent = 0). Возвращает текст или null, если откладывать нечего.
+export async function snoozeReminder(
+  db: Db,
+  chatId: number,
+  id: string,
+  remindAt: Date,
+): Promise<{ text: string } | null> {
+  const rows = check(
+    await db.from("reminders").update({
+      status: "pending",
+      remind_at: remindAt.toISOString(),
+      nag_sent: 0,
+    }).eq("id", id).eq("chat_id", chatId).in("status", [
+      "pending",
+      "sending",
+      "sent",
+    ]).select("text"),
+    "отложить напоминание",
+  );
+  return rows && rows.length > 0 ? { text: rows[0].text as string } : null;
+}
+
 // Отправка не удалась: возвращаем в pending, следующий запуск tick попробует снова.
 export async function releaseReminder(db: Db, id: string): Promise<void> {
   check(

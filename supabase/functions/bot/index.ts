@@ -21,6 +21,7 @@ import {
   getSettings,
   listPendingReminders,
   setSession,
+  snoozeReminder,
   stopReminder,
   updateReminder,
 } from "../_shared/db.ts";
@@ -62,6 +63,7 @@ const store: Store = {
   listPendingReminders: (chatId) => listPendingReminders(db, chatId),
   cancelReminder: (chatId, id) => cancelReminder(db, chatId, id),
   stopReminder: (chatId, id) => stopReminder(db, chatId, id),
+  snoozeReminder: (chatId, id, at) => snoozeReminder(db, chatId, id, at),
   getReminder: (chatId, id) => getReminder(db, chatId, id),
   updateReminder: (chatId, id, patch) => updateReminder(db, chatId, id, patch),
 };

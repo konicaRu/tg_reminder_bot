@@ -7,7 +7,7 @@
 
 import type { Reminder } from "../_shared/db.ts";
 import {
-  buildDoneKeyboard,
+  buildReminderKeyboard,
   buildReminderMessage,
   type InlineKeyboardMarkup,
 } from "../_shared/telegram.ts";
@@ -66,7 +66,7 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
       messageId = await deps.send(
         r.chat_id,
         buildReminderMessage(r.text, isNag ? { index, total } : undefined),
-        isNag ? buildDoneKeyboard(r.id) : undefined,
+        buildReminderKeyboard(r.id), // snooze и «Готово» у любого напоминания
       );
     } catch (err) {
       failed++;

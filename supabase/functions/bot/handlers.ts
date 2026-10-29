@@ -19,6 +19,7 @@ import {
   buildConfirmCard,
   buildEditMenu,
   buildListMessage,
+  buildSnoozedMessage,
   buildStoppedMessage,
   decodeCallback,
   DEFAULT_NAG,
@@ -30,7 +31,10 @@ import {
   type Nag,
   NAG_COUNTS,
   NAG_INTERVALS,
+  SNOOZE_OPTIONS,
+  SNOOZE_TOMORROW,
 } from "../_shared/telegram.ts";
+import { addDays, localParts, zonedToUtc } from "../_shared/parser/tz.ts";
 
 // --- Что нужно «мозгу» снаружи -----------------------------------------------
 
@@ -57,6 +61,12 @@ export type Store = {
   cancelReminder(chatId: number, id: string): Promise<boolean>;
   // «Готово»: останавливает напоминание и серию; null, если останавливать нечего
   stopReminder(chatId: number, id: string): Promise<{ text: string } | null>;
+  // Snooze: перенести на новое время; null, если откладывать нечего (отменено, закрыто, чужое)
+  snoozeReminder(
+    chatId: number,
+    id: string,
+    remindAt: Date,
+  ): Promise<{ text: string } | null>;
   // Правка из /list: одно ожидающее напоминание (null, если уже сработало/удалено/чужое)
   getReminder(chatId: number, id: string): Promise<Reminder | null>;
   // false, если править уже нельзя (напоминание успело сработать или удалено)
@@ -111,6 +121,14 @@ export function parseAllowedIds(raw: string | undefined): number[] {
     return n;
   });
   return [...new Set(ids)]; // дубли убираем
+}
+
+// «Завтра» для snooze: завтрашний день в поясе пользователя, время по умолчанию («09:00»).
+function tomorrowAtDefaultTime(now: Date, s: Settings): Date {
+  const today = localParts(now, s.timezone);
+  const t = addDays({ y: today.y, m: today.m, d: today.d }, 1);
+  const [h, mi] = s.default_time.split(":").map(Number);
+  return zonedToUtc(t.y, t.m, t.d, h, mi, s.timezone);
 }
 
 // Подсказка при правке текста. Telegram не умеет подставить старый текст в поле ввода,
@@ -396,6 +414,24 @@ export function createHandlers(deps: Deps) {
 
       // «Готово» под сообщением серии: останавливаем напоминание. id здесь — id самого
       // напоминания (а не черновика), поэтому обрабатываем до проверки черновика.
+      // Snooze под сработавшим напоминанием: id тоже самого напоминания. Значение кнопки
+      // приходит извне, поэтому принимаем только те, что мы рисовали.
+      if (c.action === "snz") {
+        if (c.arg === undefined || !SNOOZE_OPTIONS.includes(c.arg)) {
+          return io.answer();
+        }
+        const settings = await store.getSettings(io.chatId);
+        const now = deps.now();
+        const at = c.arg === SNOOZE_TOMORROW
+          ? tomorrowAtDefaultTime(now, settings)
+          : new Date(now.getTime() + c.arg * 60_000);
+        const snoozed = await store.snoozeReminder(io.chatId, c.id, at);
+        if (!snoozed) return io.answer("Уже неактуально");
+        const when = formatWhen(at, settings.timezone, now);
+        await io.edit(buildSnoozedMessage(snoozed.text, when)); // кнопки исчезают
+        return io.answer("Отложено");
+      }
+
       if (c.action === "done") {
         const stopped = await store.stopReminder(io.chatId, c.id);
         if (!stopped) return io.answer("Уже остановлено");

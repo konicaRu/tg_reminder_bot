@@ -70,6 +70,18 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
       r.status = "done";
       return Promise.resolve({ text: r.text });
     },
+    // snooze: пока запись не отменена/закрыта; серию начинаем заново (как в db.ts)
+    snoozeReminder: (chatId, id, remindAt) => {
+      const r = reminders.find((x) =>
+        x.id === id && x.chat_id === chatId &&
+        ["pending", "sending", "sent"].includes(x.status)
+      );
+      if (!r) return Promise.resolve(null);
+      r.status = "pending";
+      r.remind_at = remindAt.toISOString();
+      r.nag_sent = 0;
+      return Promise.resolve({ text: r.text });
+    },
     getReminder: (chatId, id) =>
       Promise.resolve(
         reminders.find((x) =>
@@ -816,4 +828,56 @@ Deno.test("правка текста: подсказка показывает с
   await t.h.callback(t.io, buttonData(t.sent, "Текст"));
   const prompt = t.sent.filter((s) => s.kind === "edit").at(-1)!.text!;
   assertEquals(prompt.includes("<code>встреча &lt;Петя&gt;</code>"), true);
+});
+
+// --- Snooze ------------------------------------------------------------------
+
+// Напоминание «сработало»: статус sent, сообщение у пользователя уже есть.
+async function withFired() {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 11 встреча");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  t.reminders[0].status = "sent";
+  t.reminders[0].nag_sent = 3;
+  return t;
+}
+
+Deno.test("snooze: «+10 мин» и «+1 час» считаются от «сейчас», запись снова pending, серия с нуля", async () => {
+  const t = await withFired();
+  await t.h.callback(t.io, "snz:rem-1:10");
+  assertEquals(t.reminders[0].status, "pending");
+  assertEquals(t.reminders[0].remind_at, "2026-10-28T09:10:00.000Z");
+  assertEquals(t.reminders[0].nag_sent, 0);
+  assertEquals(
+    t.sent.filter((s) => s.kind === "edit").at(-1)!.text,
+    "💤 <b>Отложено до 28.10 в 12:10</b>\nвстреча",
+  );
+  assertEquals(
+    t.sent.filter((s) => s.kind === "edit").at(-1)!.markup,
+    undefined,
+  );
+  await t.h.callback(t.io, "snz:rem-1:60");
+  assertEquals(t.reminders[0].remind_at, "2026-10-28T10:00:00.000Z");
+});
+
+Deno.test("snooze: «Завтра» = завтра в 09:00 по Москве (default_time)", async () => {
+  const t = await withFired();
+  await t.h.callback(t.io, "snz:rem-1:1440");
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T06:00:00.000Z");
+});
+
+Deno.test("snooze: левое значение, чужой чат, отменённое и закрытое — ничего не меняют", async () => {
+  const t = await withFired();
+  const before = t.reminders[0].remind_at;
+  await t.h.callback(t.io, "snz:rem-1:5"); // нет такой кнопки
+  await t.h.callback({ ...t.io, chatId: CHAT + 1 }, "snz:rem-1:10"); // чужой
+  assertEquals(t.reminders[0].remind_at, before);
+  assertEquals(t.reminders[0].status, "sent");
+  t.reminders[0].status = "cancelled";
+  await t.h.callback(t.io, "snz:rem-1:10");
+  assertEquals(t.reminders[0].status, "cancelled");
+  assertEquals(
+    t.sent.some((s) => s.kind === "answer" && s.text === "Уже неактуально"),
+    true,
+  );
 });

@@ -5,10 +5,11 @@
 import { deepStrictEqual as assertEquals } from "node:assert";
 import {
   buildConfirmCard,
-  buildDoneKeyboard,
   buildEditMenu,
   buildListMessage,
+  buildReminderKeyboard,
   buildReminderMessage,
+  buildSnoozedMessage,
   buildStoppedMessage,
   decodeCallback,
   DEFAULT_NAG,
@@ -352,10 +353,36 @@ Deno.test("сообщение серии: «(k из N)» в заголовке",
   );
 });
 
-Deno.test("кнопка «Готово» несёт id напоминания", () => {
-  assertEquals(buildDoneKeyboard("rem-1"), {
-    inline_keyboard: [[{ text: "✅ Готово", callback_data: "done:rem-1" }]],
+Deno.test("кнопки под напоминанием: snooze (+10 мин, +1 час, Завтра) и «Готово», все несут id", () => {
+  assertEquals(buildReminderKeyboard("rem-1"), {
+    inline_keyboard: [
+      [
+        { text: "+10 мин", callback_data: "snz:rem-1:10" },
+        { text: "+1 час", callback_data: "snz:rem-1:60" },
+        { text: "Завтра", callback_data: "snz:rem-1:1440" },
+      ],
+      [{ text: "✅ Готово", callback_data: "done:rem-1" }],
+    ],
   });
+});
+
+Deno.test("snooze: callback разбирается, uuid укладывается в 64 байта", () => {
+  const uuid = "123e4567-e89b-12d3-a456-426614174000";
+  assertEquals(decodeCallback(`snz:${uuid}:60`), {
+    action: "snz",
+    id: uuid,
+    arg: 60,
+  });
+  for (const b of buildReminderKeyboard(uuid).inline_keyboard.flat()) {
+    assertEquals(new TextEncoder().encode(b.callback_data).length <= 64, true);
+  }
+});
+
+Deno.test("сообщение после snooze: «💤 Отложено до …» с экранированным текстом", () => {
+  assertEquals(
+    buildSnoozedMessage("a < b", "29.10 в 12:30"),
+    "💤 <b>Отложено до 29.10 в 12:30</b>\na &lt; b",
+  );
 });
 
 Deno.test("после «Готово» сообщение превращается в «✅ Готово» с текстом (экранированным)", () => {

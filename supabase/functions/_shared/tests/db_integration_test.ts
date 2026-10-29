@@ -25,6 +25,7 @@ import {
   markReminderSent,
   releaseReminder,
   setSession,
+  snoozeReminder,
   stopReminder,
   updateReminder,
 } from "../db.ts";
@@ -391,5 +392,29 @@ dbTest(
     await cancelReminder(db, CHAT, r.id);
     assertEquals(await updateReminder(db, CHAT, r.id, { text: "z" }), false);
     assertEquals(await getReminder(db, CHAT, r.id), null);
+  },
+);
+
+dbTest(
+  "snoozeReminder: сработавшее возвращается в pending на новое время, серия с нуля; отменённое и чужое — нет",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "отложить",
+      remind_at: PAST(),
+      nag: { intervalMin: 5, total: 3 },
+    });
+    await claimDueReminders(db);
+    await markReminderSent(db, r.id, 1, { nagSent: 3 }); // серия закончилась: sent
+    const later = new Date(Date.now() + 10 * 60 * 1000);
+    assertEquals(await snoozeReminder(db, CHAT - 1, r.id, later), null); // чужой
+    assertEquals(await snoozeReminder(db, CHAT, r.id, later), {
+      text: "отложить",
+    });
+    const got = await getReminder(db, CHAT, r.id); // getReminder видит только pending
+    assertEquals(new Date(got!.remind_at).getTime(), later.getTime());
+    assertEquals(got?.nag_sent, 0);
+    await cancelReminder(db, CHAT, r.id);
+    assertEquals(await snoozeReminder(db, CHAT, r.id, later), null);
   },
 );

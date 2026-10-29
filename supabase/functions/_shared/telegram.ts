@@ -24,6 +24,7 @@ export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 //   edit  — открыть меню правки напоминания из /list
 //   etxt  — править текст     etime — править время
 //   list  — вернуться к списку
+//   snz   — отложить сработавшее напоминание (минуты; 1440 = «завтра»)
 //   dtxt  — править текст на карточке подтверждения (до «OK»)
 export type CallbackAction =
   | "ok"
@@ -37,7 +38,8 @@ export type CallbackAction =
   | "etxt"
   | "etime"
   | "list"
-  | "dtxt";
+  | "dtxt"
+  | "snz";
 
 // «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
 // (считая первое), пока пользователь не нажмёт «Готово».
@@ -129,7 +131,7 @@ export function decodeCallback(
         data,
       );
   if (plain) return { action: plain[1] as CallbackAction, id: plain[2] };
-  const withArg = /^(ivl|cnt):([A-Za-z0-9_-]{1,50}):(\d{1,4})$/.exec(data);
+  const withArg = /^(ivl|cnt|snz):([A-Za-z0-9_-]{1,50}):(\d{1,4})$/.exec(data);
   if (withArg) {
     return {
       action: withArg[1] as CallbackAction,
@@ -274,14 +276,32 @@ export function buildReminderMessage(
   return `⏰ <b>Напоминание</b>${counter}\n${escapeHtml(text)}`;
 }
 
-// Кнопка «Готово» под сообщением серии: нажатие останавливает повторы.
-export function buildDoneKeyboard(reminderId: string): InlineKeyboardMarkup {
+// Значения snooze на кнопках: минуты; SNOOZE_TOMORROW = «завтра в время по умолчанию».
+export const SNOOZE_TOMORROW = 1440;
+export const SNOOZE_OPTIONS = [10, 60, SNOOZE_TOMORROW];
+
+// Кнопки под сработавшим напоминанием: отложить или «Готово» (останавливает серию повторов).
+export function buildReminderKeyboard(
+  reminderId: string,
+): InlineKeyboardMarkup {
+  const snz = (arg: number, text: string): InlineButton => ({
+    text,
+    callback_data: encodeCallback({ action: "snz", id: reminderId, arg }),
+  });
   return {
-    inline_keyboard: [[{
-      text: "✅ Готово",
-      callback_data: encodeCallback({ action: "done", id: reminderId }),
-    }]],
+    inline_keyboard: [
+      [snz(10, "+10 мин"), snz(60, "+1 час"), snz(SNOOZE_TOMORROW, "Завтра")],
+      [{
+        text: "✅ Готово",
+        callback_data: encodeCallback({ action: "done", id: reminderId }),
+      }],
+    ],
   };
+}
+
+// Во что превращается сообщение после snooze («when» уже отформатировано для человека).
+export function buildSnoozedMessage(text: string, when: string): string {
+  return `💤 <b>Отложено до ${when}</b>\n${escapeHtml(text)}`;
 }
 
 // Во что превращается сообщение после нажатия «Готово».
