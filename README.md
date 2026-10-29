@@ -4,7 +4,7 @@
 
 **Напиши или наговори «завтра в 11 встреча» — и в нужное время бот пришлёт сообщение.**
 
-![Статус](https://img.shields.io/badge/статус-фаза%200%20(подготовка)-orange)
+![Статус](https://img.shields.io/badge/статус-фаза%201%20(MVP)%20готова-brightgreen)
 ![Deno](https://img.shields.io/badge/Deno-TypeScript-000000?logo=deno&logoColor=white)
 ![Supabase](https://img.shields.io/badge/Supabase-Edge%20Functions%20%2B%20Postgres-3ECF8E?logo=supabase&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?logo=telegram&logoColor=white)
@@ -89,36 +89,57 @@
 ```
 supabase/
   functions/
-    bot/index.ts        # webhook: роутинг сообщений и кнопок
-    tick/index.ts       # отправка наступивших напоминаний
-    _shared/            # parser/ (+tests), groq.ts, telegram.ts, db.ts, repeat.ts
-  migrations/           # SQL-миграции
-miniapp/                # фаза 5, статика для GitHub Pages
+    bot/                # webhook: handlers.ts (логика диалога), index.ts (grammY, whitelist, секрет)
+    tick/               # logic.ts + index.ts: отправка наступивших напоминаний
+    set-webhook/        # одноразовая функция: регистрирует webhook у Telegram с сервера
+    _shared/
+      parser/           # mod.ts (разбор дат на правилах), tz.ts (пояса), tests/
+      groq.ts           # запасной разбор фраз через Groq LLM
+      telegram.ts       # карточка, список, кнопки, формат дат
+      telegram_api.ts   # вызовы Bot API (с очисткой токена из ошибок)
+      db.ts             # все запросы к базе
+      tests/            # тесты общего кода (+ интеграционные тесты БД)
+  migrations/           # SQL-миграции: таблицы и расписание pg_cron
+miniapp/                # фаза 5 (пока нет)
 CLAUDE.md               # правила работы для Claude Code
 PLAN.md                 # чек-лист по фазам
 ```
 
-> Часть папок появится по ходу фаз: сейчас в репозитории только документы.
+Тесты: `cd supabase/functions && deno test` (интеграционные тесты базы пропускаются без `SUPABASE_URL` и `SUPABASE_SERVICE_ROLE_KEY`).
 
 ## 🚀 Развернуть с нуля
 
-Подробный чек-лист с пояснениями — в [PLAN.md](PLAN.md), фаза 0. Коротко:
+Подробный чек-лист с пояснениями — в [PLAN.md](PLAN.md), фаза 0. Ниже — порядок, проверенный на практике.
 
 1. **BotFather** → создать бота, получить токен. *Токен — пароль бота, в код и git его не кладём.*
 2. Узнать свой Telegram `user_id` (например, через @userinfobot) — для whitelist.
 3. Создать проект **Supabase** (регион EU).
-4. Установить **Supabase CLI**, затем `supabase login` и `supabase link`.
-5. Получить ключ **Groq** на console.groq.com.
-6. Положить секреты в Supabase Secrets (список ниже).
-7. Применить миграции и задеплоить функции:
+4. Установить **Supabase CLI**, затем `supabase login` и `supabase link --project-ref <ref>`.
+5. Получить ключ **Groq** на console.groq.com. Какие модели доступны именно твоему ключу, зависит от аккаунта: в проверенной установке работала `openai/gpt-oss-120b` (а `llama-3.3-70b-versatile` отвечала `model_not_found`).
+6. Скопировать `.env.example` в `.env`, заполнить, затем загрузить секреты в Supabase:
    ```bash
-   supabase db push
-   supabase functions deploy bot --no-verify-jwt   # Telegram не умеет слать JWT Supabase
-   supabase functions deploy tick
+   supabase secrets set --env-file .env
    ```
-8. Зарегистрировать webhook у Telegram (с `secret_token`).
-
-> Пункты 7–8 станут актуальны в фазе 1; точные команды будут уточнены, когда появится код.
+   `TELEGRAM_WEBHOOK_SECRET` и `TICK_SECRET` — это длинные случайные строки (например, 64 hex-символа), придумай их сам.
+7. Задеплоить функции (обе с `--no-verify-jwt`: Telegram и pg_cron не умеют слать JWT Supabase, защита — собственные секреты):
+   ```bash
+   supabase functions deploy bot  --no-verify-jwt --use-api   # --use-api: без Docker
+   supabase functions deploy tick --no-verify-jwt --use-api
+   ```
+8. Применить миграции: `supabase db push`. Если он падает с `Connection error`, примени файлы по порядку командой
+   `supabase db query --linked -f supabase/migrations/<файл>.sql` и запиши их в таблицу истории `supabase_migrations.schema_migrations`.
+9. Положить `TICK_SECRET` в **Vault** (расписание читает его оттуда, в git его нет), например через SQL Editor:
+   ```sql
+   select vault.create_secret('<значение TICK_SECRET>', 'tick_secret');
+   ```
+10. Зарегистрировать webhook с сервера (с некоторых сетей `api.telegram.org` недоступен): задеплоить `set-webhook`,
+    вызвать `POST` с заголовком `x-tick-secret`, проверить `GET` (адрес верный, нет `last_error_message`), затем удалить функцию:
+    ```bash
+    supabase functions deploy set-webhook --no-verify-jwt --use-api
+    curl -X POST https://<ref>.supabase.co/functions/v1/set-webhook -H "x-tick-secret: <TICK_SECRET>"
+    supabase functions delete set-webhook
+    ```
+11. Проверка: `bot` и `tick` без секрета отвечают `401`; в Telegram бот отвечает на `/start`; `select * from cron.job` показывает задание `tick-every-minute`.
 
 ## 🔒 Безопасность
 
@@ -126,15 +147,16 @@ PLAN.md                 # чек-лист по фазам
 |---|---|
 | Секреты | Только в Supabase Secrets, не в коде и не в git. `.env` в `.gitignore` |
 | Webhook `bot` | Деплой с `--no-verify-jwt`, поэтому обязательна проверка заголовка `X-Telegram-Bot-Api-Secret-Token` |
-| Функция `tick` | Проверяет свой секрет `TICK_SECRET` |
+| Функция `tick` | Деплой с `--no-verify-jwt` (pg_cron не шлёт JWT), поэтому проверяет свой секрет `TICK_SECRET` в заголовке `x-tick-secret` (сравнение за постоянное время); без него `401` |
+| Токен бота | Входит в адрес запросов к Telegram, поэтому ошибки сети «чистятся» от адреса перед записью в логи; текст напоминаний в логи не пишется |
 | Whitelist | На сообщения не от `ALLOWED_USER_ID` бот не отвечает |
 
 Секреты: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`.
 
 ## 🗺 Дорожная карта
 
-- [ ] **Фаза 0** — подготовка (BotFather, Supabase, Groq, секреты)
-- [ ] **Фаза 1** — MVP: «через 3 минуты» приходит на телефон
+- [x] **Фаза 0** — подготовка (BotFather, Supabase, Groq, секреты)
+- [x] **Фаза 1** — MVP: «через 3 минуты» приходит на телефон
 - [ ] **Фаза 2** — snooze, редактирование, календарь, повторы
 - [ ] **Фаза 3** — вложения
 - [ ] **Фаза 4** — голос
@@ -147,3 +169,9 @@ PLAN.md                 # чек-лист по фазам
 - Утренняя сводка «на сегодня у тебя: …»
 - Напоминание с повтором «пока не нажмёшь Готово»
 - Статистика выполненных напоминаний
+- Резервная LLM (Gemini, бесплатный тариф) на случай, если Groq недоступен или лимитирован
+- Слово «напомни» вырезается из текста только в начале фразы; «через минуту напомни …» оставляет «напомни» в тексте
+- Напоминание, которое стабильно не отправляется (например, бот заблокирован), `tick` пробует каждую минуту бесконечно: нужен счётчик попыток
+- Если сообщение ушло, а статус `sent` записать не удалось (двойной сбой), через 5 минут возможен повторный показ
+- Интеграционные тесты базы нестабильно работают из сети в РФ (Deno-клиент «залипает»): запускать их на CI или другом хосте
+- Слова про время суток без цифр («после обеда», «утром») правила игнорируют: время берётся по умолчанию, карточка позволяет поправить
