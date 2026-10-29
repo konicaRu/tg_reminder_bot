@@ -80,6 +80,7 @@ function setup(
       released.push(id);
       return Promise.resolve();
     },
+    getTimezone: () => Promise.resolve("Europe/Moscow"),
   };
 
   const send = (chatId: number, text: string, markup?: unknown) => {
@@ -396,4 +397,111 @@ Deno.test("серия вперемешку с обычными: каждое о�
   });
   assertEquals(t.marked[0].next, {}); // обычное → sent
   assertEquals(t.marked[1].next.nagSent, 1); // серия → ещё повторы
+});
+
+// =============================================================================
+// Повторы по расписанию
+// =============================================================================
+
+// Напоминание «каждый день в 9»; NOW = 29.10 11:00:30 по Москве, так что следующее — 30.10 09:00.
+const DAILY9 = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0";
+const schedRem = (id: string, extra: Partial<Reminder> = {}): Reminder => ({
+  ...rem(id, 555, "зарядка"),
+  rrule: DAILY9,
+  ...extra,
+});
+// кнопки у сработавшего напоминания по расписанию: snooze, «Готово» и «Прекратить повторы»
+const schedButtons = (id: string) => ({
+  inline_keyboard: [
+    [
+      { text: "+10 мин", callback_data: `snz:${id}:10` },
+      { text: "+1 час", callback_data: `snz:${id}:60` },
+      { text: "Завтра", callback_data: `snz:${id}:1440` },
+    ],
+    [
+      { text: "✅ Готово", callback_data: `done:${id}` },
+      { text: "⛔ Прекратить повторы", callback_data: `stop:${id}` },
+    ],
+  ],
+});
+
+Deno.test("расписание: после отправки запись не закрывается, а планируется на следующее срабатывание", async () => {
+  const t = setup([schedRem("s1")]);
+  const summary = await runTick(t.deps);
+  assertEquals(t.sentMessages[0].markup, schedButtons("s1"));
+  assertEquals(t.marked, [{
+    id: "s1",
+    messageId: 101,
+    next: { nextRemindAt: new Date("2026-10-30T06:00:00Z") }, // завтра 09:00 МСК
+  }]);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+});
+
+Deno.test("расписание: следующее считается от «сейчас», а не от старого срока (после простоя нет пачки)", async () => {
+  // срок был 3 дня назад, tick простоял
+  const t = setup([schedRem("s1", { remind_at: "2026-10-26T06:00:00Z" })]);
+  await runTick(t.deps);
+  assertEquals(t.marked.length, 1);
+  assertEquals(
+    t.marked[0].next.nextRemindAt,
+    new Date("2026-10-30T06:00:00Z"),
+  );
+  assertEquals(t.sentMessages.length, 1); // одно сообщение, а не три
+});
+
+Deno.test("расписание: у предыдущего срабатывания снимаем кнопки", async () => {
+  const t = setup([schedRem("s1", { last_message_id: 77 })]);
+  await runTick(t.deps);
+  assertEquals(t.cleared, [{ chatId: 555, messageId: 77, afterSends: 1 }]);
+});
+
+Deno.test("расписание + серия: пока серия идёт — интервал, после последнего сообщения — следующее по расписанию", async () => {
+  const mid = setup([
+    schedRem("s1", { nag_interval_min: 5, nag_total: 3, nag_sent: 0 }),
+  ]);
+  await runTick(mid.deps);
+  assertEquals(mid.marked[0].next, {
+    nagSent: 1,
+    nextRemindAt: new Date("2026-10-29T08:05:00Z"),
+  });
+  const last = setup([
+    schedRem("s2", { nag_interval_min: 5, nag_total: 3, nag_sent: 2 }),
+  ]);
+  await runTick(last.deps);
+  assertEquals(last.marked[0].next, {
+    nagSent: 0, // серия закончилась: к следующему срабатыванию счётчик с нуля
+    nextRemindAt: new Date("2026-10-30T06:00:00Z"),
+  });
+});
+
+Deno.test("расписание: «Прекратить повторы» во время отправки главнее (ответ false — не возобновляем)", async () => {
+  const t = setup([schedRem("s1")], { userStoppedFirst: true });
+  const summary = await runTick(t.deps);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+  assertEquals(t.marked.length, 1); // попытка была, база ответила «уже не sending»
+});
+
+Deno.test("расписание: битая строка rrule → напоминание считается обычным (sent), в лог пишем без текста", async () => {
+  const t = setup([schedRem("s1", { rrule: "FREQ=MONTHLY" })]);
+  await runTick(t.deps);
+  assertEquals(t.marked[0].next, {});
+  assertEquals(t.logs.some((l) => l.includes("s1")), true);
+  assertEquals(t.logs.some((l) => l.includes("зарядка")), false);
+});
+
+Deno.test("расписание: часовой пояс берём из настроек чата (Екатеринбург, 09:00 = 04:00Z)", async () => {
+  const t = setup([schedRem("s1")]);
+  const deps = {
+    ...t.deps,
+    store: {
+      ...t.deps.store,
+      getTimezone: () => Promise.resolve("Asia/Yekaterinburg"),
+    },
+  };
+  await runTick(deps);
+  // NOW = 08:00:30Z = 13:00 по Екатеринбургу → следующее 30.10 09:00 по Екатеринбургу
+  assertEquals(
+    t.marked[0].next.nextRemindAt,
+    new Date("2026-10-30T04:00:00Z"),
+  );
 });

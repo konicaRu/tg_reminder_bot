@@ -188,11 +188,12 @@ export async function updateReminder(
   db: Db,
   chatId: number,
   id: string,
-  patch: { text?: string; remind_at?: Date },
+  patch: { text?: string; remind_at?: Date; rrule?: string },
 ): Promise<boolean> {
   const rows = check(
     await db.from("reminders").update({
       ...(patch.text !== undefined ? { text: patch.text } : {}),
+      ...(patch.rrule !== undefined ? { rrule: patch.rrule } : {}),
       ...(patch.remind_at
         ? { remind_at: patch.remind_at.toISOString(), nag_sent: 0 }
         : {}),
@@ -294,6 +295,39 @@ export async function stopReminder(
     "остановка напоминания",
   );
   return rows && rows.length > 0 ? { text: rows[0].text as string } : null;
+}
+
+// «Готово». Если у напоминания есть расписание (rrule), закрывается только это срабатывание:
+// запись возвращается в pending на следующее время (его считает nextFor), серия повторов
+// «каждые N минут» обнуляется. Без расписания работает как stopReminder (статус done).
+// Возвращает текст (и nextAt, если расписание продолжается) или null, если делать нечего.
+export async function completeReminder(
+  db: Db,
+  chatId: number,
+  id: string,
+  nextFor: (rrule: string) => Date | null,
+): Promise<{ text: string; nextAt?: Date } | null> {
+  const open = ["pending", "sending", "sent"];
+  const rows = check(
+    await db.from("reminders").select("text,rrule")
+      .eq("id", id).eq("chat_id", chatId).in("status", open).limit(1),
+    "чтение напоминания",
+  );
+  const row = rows?.[0];
+  if (!row) return null;
+  const next = row.rrule ? nextFor(row.rrule as string) : null;
+  if (!next) return await stopReminder(db, chatId, id);
+  const updated = check(
+    await db.from("reminders").update({
+      status: "pending",
+      remind_at: next.toISOString(),
+      nag_sent: 0,
+    }).eq("id", id).eq("chat_id", chatId).in("status", open).select("id"),
+    "следующее срабатывание",
+  );
+  return (updated?.length ?? 0) > 0
+    ? { text: row.text as string, nextAt: next }
+    : null;
 }
 
 // Snooze: переносит сработавшее (или ожидающее) напоминание на новое время.

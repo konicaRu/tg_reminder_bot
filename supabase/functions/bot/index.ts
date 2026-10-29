@@ -14,6 +14,7 @@ import { Bot, type Context, GrammyError, webhookCallback } from "npm:grammy@1";
 import {
   cancelReminder,
   clearSession,
+  completeReminder,
   createDb,
   createReminder,
   getReminder,
@@ -63,6 +64,8 @@ const store: Store = {
   listPendingReminders: (chatId) => listPendingReminders(db, chatId),
   cancelReminder: (chatId, id) => cancelReminder(db, chatId, id),
   stopReminder: (chatId, id) => stopReminder(db, chatId, id),
+  completeReminder: (chatId, id, nextFor) =>
+    completeReminder(db, chatId, id, nextFor),
   snoozeReminder: (chatId, id, at) => snoozeReminder(db, chatId, id, at),
   getReminder: (chatId, id) => getReminder(db, chatId, id),
   updateReminder: (chatId, id, patch) => updateReminder(db, chatId, id, patch),

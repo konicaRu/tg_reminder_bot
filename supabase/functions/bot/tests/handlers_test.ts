@@ -70,6 +70,23 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
       r.status = "done";
       return Promise.resolve({ text: r.text });
     },
+    // «Готово»: у напоминания по расписанию — к следующему срабатыванию, у обычного — закрыть
+    completeReminder: (chatId, id, nextFor) => {
+      const r = reminders.find((x) =>
+        x.id === id && x.chat_id === chatId &&
+        ["pending", "sending", "sent"].includes(x.status)
+      );
+      if (!r) return Promise.resolve(null);
+      const next = r.rrule ? nextFor(r.rrule) : null;
+      if (next) {
+        r.status = "pending";
+        r.remind_at = next.toISOString();
+        r.nag_sent = 0;
+        return Promise.resolve({ text: r.text, nextAt: next });
+      }
+      r.status = "done";
+      return Promise.resolve({ text: r.text });
+    },
     // snooze: пока запись не отменена/закрыта; серию начинаем заново (как в db.ts)
     snoozeReminder: (chatId, id, remindAt) => {
       const r = reminders.find((x) =>
@@ -95,6 +112,7 @@ function setup(opts: { llm?: (input: string) => Promise<ParseResult> } = {}) {
       );
       if (!r) return Promise.resolve(false);
       if (patch.text !== undefined) r.text = patch.text;
+      if (patch.rrule !== undefined) r.rrule = patch.rrule;
       if (patch.remind_at) {
         r.remind_at = patch.remind_at.toISOString();
         r.nag_sent = 0;
@@ -255,6 +273,7 @@ Deno.test("текст: показываем карточку, в базу НИЧ
       remind_at: "2026-10-28T09:03:00.000Z",
       adjusted: null,
       nag: null, // повтор по умолчанию выключен
+      rrule: null, // расписания нет: разовое
     },
   });
 });
@@ -303,13 +322,10 @@ Deno.test("текст: дата есть, а о чём напомнить — н
   assertEquals(t.llmCalls(), 0);
 });
 
-Deno.test("текст: повтор («каждый день») → честно говорим, что пока не умеем", async () => {
+Deno.test("текст: повтор, который не умеем («каждый месяц»), → честно говорим", async () => {
   const t = setup({ llm: llmFails });
-  await t.h.text(t.io, "каждый день в 9 зарядка");
-  assertEquals(
-    t.sent[0].text!.includes("Повторяющиеся напоминания пока не умею"),
-    true,
-  );
+  await t.h.text(t.io, "каждый месяц 15 числа оплата");
+  assertEquals(t.sent[0].text!.includes("пока умею только"), true);
   assertEquals(t.llmCalls(), 0);
 });
 
@@ -880,4 +896,84 @@ Deno.test("snooze: левое значение, чужой чат, отменё�
     t.sent.some((s) => s.kind === "answer" && s.text === "Уже неактуально"),
     true,
   );
+});
+
+// --- Повторы по расписанию ---------------------------------------------------
+
+// Создаёт «каждый день в 9 зарядка» и подтверждает; NOW = среда 12:00 МСК → первое 29.10 09:00.
+async function withSchedule() {
+  const t = setup();
+  await t.h.text(t.io, "каждый день в 9 зарядка");
+  return t;
+}
+
+Deno.test("расписание: карточка показывает повтор, OK сохраняет rrule, финал тоже про повтор", async () => {
+  const t = await withSchedule();
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(
+    card.text,
+    "Напомню <b>29.10 в 09:00</b>: зарядка\n📆 Повторяется каждый день в 09:00",
+  );
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].rrule, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T06:00:00.000Z");
+  const done = t.sent.filter((s) => s.kind === "edit").at(-1)!;
+  assertEquals(done.text!.includes("📆 Повторяется каждый день в 09:00"), true);
+});
+
+Deno.test("расписание: «✅ Готово» не закрывает, а переносит на следующее срабатывание", async () => {
+  const t = await withSchedule();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  t.reminders[0].status = "sent"; // сработало (сегодня уже 12:00 МСК)
+  await t.h.callback(t.io, "done:rem-1");
+  assertEquals(t.reminders[0].status, "pending");
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T06:00:00.000Z");
+  const msg = t.sent.filter((s) => s.kind === "edit").at(-1)!.text!;
+  assertEquals(msg.includes("Готово"), true);
+  assertEquals(msg.includes("Следующее: 29.10 в 09:00"), true);
+});
+
+Deno.test("расписание: «⛔ Прекратить повторы» закрывает насовсем", async () => {
+  const t = await withSchedule();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.callback(t.io, "stop:rem-1");
+  assertEquals(t.reminders[0].status, "done");
+  assertEquals(
+    t.sent.filter((s) => s.kind === "edit").at(-1)!.text,
+    "⛔ <b>Повторы прекращены</b>\nзарядка",
+  );
+  await t.h.callback(t.io, "stop:rem-1"); // повторное нажатие
+  assertEquals(
+    t.sent.some((s) => s.kind === "answer" && s.text === "Уже остановлено"),
+    true,
+  );
+});
+
+Deno.test("расписание: правка времени с «каждый…» заменяет расписание, без — двигает только ближайшее", async () => {
+  const t = await withSchedule();
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "завтра в 10"); // без «каждый»: только ближайшее срабатывание
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T07:00:00.000Z");
+  assertEquals(t.reminders[0].rrule, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
+
+  await t.h.callback(t.io, buttonData(t.sent, "К списку"));
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "Время"));
+  await t.h.text(t.io, "по будням в 8"); // новое расписание
+  assertEquals(
+    t.reminders[0].rrule,
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0",
+  );
+  assertEquals(t.reminders[0].remind_at, "2026-10-29T05:00:00.000Z");
+});
+
+Deno.test("расписание: «Другое время» на карточке с фразой без «каждый» делает разовое", async () => {
+  const t = await withSchedule();
+  await t.h.callback(t.io, buttonData(t.sent, "Другое время"));
+  await t.h.text(t.io, "завтра в 12");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].rrule, null);
 });

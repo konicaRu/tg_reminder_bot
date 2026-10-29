@@ -19,6 +19,7 @@ import {
   buildConfirmCard,
   buildEditMenu,
   buildListMessage,
+  buildSeriesStoppedMessage,
   buildSnoozedMessage,
   buildStoppedMessage,
   decodeCallback,
@@ -35,6 +36,7 @@ import {
   SNOOZE_TOMORROW,
 } from "../_shared/telegram.ts";
 import { addDays, localParts, zonedToUtc } from "../_shared/parser/tz.ts";
+import { describeRrule, nextOccurrence } from "../_shared/repeat.ts";
 
 // --- Что нужно «мозгу» снаружи -----------------------------------------------
 
@@ -61,6 +63,13 @@ export type Store = {
   cancelReminder(chatId: number, id: string): Promise<boolean>;
   // «Готово»: останавливает напоминание и серию; null, если останавливать нечего
   stopReminder(chatId: number, id: string): Promise<{ text: string } | null>;
+  // «Готово»: у напоминания по расписанию переносит на следующее срабатывание (его считает
+  // nextFor по строке rrule), у обычного закрывает. nextAt задан, если расписание продолжается.
+  completeReminder(
+    chatId: number,
+    id: string,
+    nextFor: (rrule: string) => Date | null,
+  ): Promise<{ text: string; nextAt?: Date } | null>;
   // Snooze: перенести на новое время; null, если откладывать нечего (отменено, закрыто, чужое)
   snoozeReminder(
     chatId: number,
@@ -73,7 +82,7 @@ export type Store = {
   updateReminder(
     chatId: number,
     id: string,
-    patch: { text?: string; remind_at?: Date },
+    patch: { text?: string; remind_at?: Date; rrule?: string },
   ): Promise<boolean>;
 };
 
@@ -151,8 +160,9 @@ const MSG = {
   noDate: "Не понял, когда напомнить 🤔\n" +
     "Попробуй так: «завтра в 11 встреча» или «через 2 часа позвонить маме».",
   emptyText: "О чём напомнить? Добавь текст, например: «завтра в 11 встреча».",
-  repeat: "Повторяющиеся напоминания пока не умею, это появится позже.\n" +
-    "Могу поставить одно: например, «завтра в 9 зарядка».",
+  repeat:
+    "Такие повторы пока умею только: каждый день, по будням, по выходным " +
+    "и по дням недели.\nНапример: «каждый будний день в 9 зарядка».",
   editGone: "Уже сработало или удалено",
   editTooLate: "Это напоминание уже сработало или удалено, изменить нельзя.",
   stale: "Эта карточка устарела. Напиши напоминание заново.",
@@ -181,6 +191,7 @@ type Draft = {
   remind_at: string; // ISO, UTC
   adjusted: "tomorrow" | null;
   nag: Nag | null; // «🔁 Повторять»: настройки серии повторов, null = выключено
+  rrule?: string | null; // расписание («каждый будний день в 9»), null/нет = разовое
 };
 
 export function createHandlers(deps: Deps) {
@@ -206,6 +217,7 @@ export function createHandlers(deps: Deps) {
       now: opts.now,
       adjusted: draft.adjusted ?? undefined,
       nag: draft.nag,
+      rrule: draft.rrule,
     });
   }
 
@@ -223,6 +235,7 @@ export function createHandlers(deps: Deps) {
       remind_at: res.remindAt.toISOString(),
       adjusted: res.adjusted ?? null,
       nag,
+      rrule: res.rrule,
     };
     await store.setSession(io.chatId, CONFIRM, draft);
     const card = cardFor(draft, opts);
@@ -274,7 +287,7 @@ export function createHandlers(deps: Deps) {
       return io.reply(MSG.editTooLate);
     }
     const opts = await parseOptions(io.chatId);
-    const patch: { text?: string; remind_at?: Date } = {};
+    const patch: { text?: string; remind_at?: Date; rrule?: string } = {};
     let note = "";
 
     if (state === EDIT_TEXT) {
@@ -291,6 +304,8 @@ export function createHandlers(deps: Deps) {
       // Не поняли → остаёмся в ожидании, можно попробовать снова.
       if (!res.ok) return io.reply(failureMessage(res.reason));
       patch.remind_at = res.remindAt;
+      // Новая фраза с «каждый…» заменяет расписание; обычное время двигает только ближайшее.
+      if (res.rrule) patch.rrule = res.rrule;
       if (res.text !== r.text) patch.text = res.text; // время и текст одним сообщением
       if (res.adjusted === "tomorrow") {
         note = "Это время сегодня уже прошло, поставил на завтра.\n";
@@ -307,7 +322,8 @@ export function createHandlers(deps: Deps) {
       opts.now,
     );
     await io.reply(
-      `${note}✅ Обновлено: ${when} — ${escapeHtml(patch.text ?? r.text)}`,
+      `${note}✅ Обновлено: ${when} — ${escapeHtml(patch.text ?? r.text)}` +
+        (patch.rrule ? `\n📆 Повторяется ${describeRrule(patch.rrule)}` : ""),
       {
         inline_keyboard: [[{
           text: "📋 К списку",
@@ -433,10 +449,28 @@ export function createHandlers(deps: Deps) {
       }
 
       if (c.action === "done") {
+        const settings = await store.getSettings(io.chatId);
+        const now = deps.now();
+        const done = await store.completeReminder(
+          io.chatId,
+          c.id,
+          (rrule) => nextOccurrence(rrule, now, settings.timezone),
+        );
+        if (!done) return io.answer("Уже остановлено");
+        // У напоминания по расписанию закрыто только это срабатывание; показываем следующее.
+        const next = done.nextAt
+          ? `\n📆 Следующее: ${formatWhen(done.nextAt, settings.timezone, now)}`
+          : "";
+        await io.edit(buildStoppedMessage(done.text) + next); // кнопки исчезают
+        return io.answer(done.nextAt ? "Готово" : "Повторы остановлены");
+      }
+
+      // «⛔ Прекратить повторы»: расписание закрывается совсем.
+      if (c.action === "stop") {
         const stopped = await store.stopReminder(io.chatId, c.id);
         if (!stopped) return io.answer("Уже остановлено");
-        await io.edit(buildStoppedMessage(stopped.text)); // кнопки исчезают
-        return io.answer("Повторы остановлены");
+        await io.edit(buildSeriesStoppedMessage(stopped.text));
+        return io.answer("Повторы прекращены");
       }
 
       // Остальные кнопки работают с черновиком; проверяем, что карточка не устарела.
@@ -454,13 +488,16 @@ export function createHandlers(deps: Deps) {
           chat_id: io.chatId,
           text: draft.text,
           remind_at: remindAt,
-          rrule: null,
+          rrule: draft.rrule ?? null,
           nag,
         });
         await store.clearSession(io.chatId); // повторное нажатие уже не найдёт черновик → дубля нет
         const when = formatWhen(remindAt, settings.timezone, deps.now());
         await io.edit(
           `✅ Готово! Напомню <b>${when}</b>: ${escapeHtml(draft.text)}` +
+            (draft.rrule
+              ? `\n📆 Повторяется ${describeRrule(draft.rrule)}`
+              : "") +
             (nag ? `\n🔁 Повторю ${describeNag(nag)}` : ""),
           // Кнопка «Изменить» остаётся: ошибку можно поправить и после «OK».
           {

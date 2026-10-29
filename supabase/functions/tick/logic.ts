@@ -6,6 +6,7 @@
 // Как и в bot, база и Telegram приходят снаружи (см. TickDeps): так всё проверяется тестами.
 
 import type { Reminder } from "../_shared/db.ts";
+import { nextOccurrence } from "../_shared/repeat.ts";
 import {
   buildReminderKeyboard,
   buildReminderMessage,
@@ -24,6 +25,7 @@ export type TickStore = {
     next: { nagSent?: number; nextRemindAt?: Date },
   ): Promise<boolean>;
   releaseReminder(id: string): Promise<void>; // вернуть в очередь (sending → pending)
+  getTimezone(chatId: number): Promise<string>; // пояс чата: нужен для расписания («в 9:00»)
 };
 
 export type TickDeps = {
@@ -66,7 +68,8 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
       messageId = await deps.send(
         r.chat_id,
         buildReminderMessage(r.text, isNag ? { index, total } : undefined),
-        buildReminderKeyboard(r.id), // snooze и «Готово» у любого напоминания
+        // snooze и «Готово» у любого напоминания; у расписания ещё «Прекратить повторы»
+        buildReminderKeyboard(r.id, { repeating: !!r.rrule }),
       );
     } catch (err) {
       failed++;
@@ -90,7 +93,7 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
     // У предыдущего сообщения серии убираем кнопку «Готово»: она остаётся только у самого
     // свежего. Делаем это ПОСЛЕ успешной отправки (если бы отправка упала, у человека
     // осталась бы рабочая кнопка) и не считаем сбой критичным: это только косметика.
-    if (isNag && r.last_message_id && deps.clearKeyboard) {
+    if ((isNag || r.rrule) && r.last_message_id && deps.clearKeyboard) {
       try {
         await deps.clearKeyboard(r.chat_id, r.last_message_id);
       } catch (err) {
@@ -106,15 +109,35 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
     // следующего. Считаем его от «сейчас», а не от старого срока: после сбоя tick не должен
     // присылать накопившиеся повторы пачкой.
     const next: { nagSent?: number; nextRemindAt?: Date } = {};
+    const now = (deps.now ?? (() => new Date()))();
     if (isNag) {
       next.nagSent = index;
       if (index < total) {
-        const now = (deps.now ?? (() => new Date()))();
         // Округляем вниз до начала минуты: tick срабатывает ровно в :00, а отправка идёт на
         // секунду позже. Без округления время повтора оказалось бы чуть ПОСЛЕ ближайшего
         // запуска, и 5 минут стабильно превращались бы в 6.
         const minuteStart = Math.floor(now.getTime() / 60_000) * 60_000;
         next.nextRemindAt = new Date(minuteStart + interval * 60_000);
+      }
+    }
+
+    // Напоминание по расписанию («каждый день в 9»): когда серия закончилась (или её нет),
+    // планируем следующее срабатывание строго после «сейчас». Пропущенные из-за простоя
+    // дни не досылаем пачкой: придёт одно сообщение.
+    if (r.rrule && next.nextRemindAt === undefined) {
+      try {
+        const tz = await deps.store.getTimezone(r.chat_id);
+        const at = nextOccurrence(r.rrule, now, tz);
+        if (at) {
+          next.nextRemindAt = at;
+          if (isNag) next.nagSent = 0; // к новому срабатыванию серия начинается с нуля
+        } else {
+          log(
+            `Напоминание ${r.id}: непонятное расписание, закрываем как обычное`,
+          );
+        }
+      } catch (err) {
+        log(`Не удалось посчитать следующее для ${r.id}: ${errorMessage(err)}`);
       }
     }
 

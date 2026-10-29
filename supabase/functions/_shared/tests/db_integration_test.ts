@@ -15,6 +15,7 @@ import {
   cancelReminder,
   claimDueReminders,
   clearSession,
+  completeReminder,
   createDb,
   createReminder,
   DEFAULT_SETTINGS,
@@ -416,5 +417,39 @@ dbTest(
     assertEquals(got?.nag_sent, 0);
     await cancelReminder(db, CHAT, r.id);
     assertEquals(await snoozeReminder(db, CHAT, r.id, later), null);
+  },
+);
+
+dbTest(
+  "completeReminder: у расписания — следующее срабатывание (pending), у обычного — done; чужой и закрытое — null",
+  async (db) => {
+    const sched = await createReminder(db, {
+      chat_id: CHAT,
+      text: "по расписанию",
+      remind_at: PAST(),
+      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    });
+    const next = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    assertEquals(
+      await completeReminder(db, CHAT - 1, sched.id, () => next),
+      null,
+    ); // чужой
+    assertEquals(await completeReminder(db, CHAT, sched.id, () => next), {
+      text: "по расписанию",
+      nextAt: next,
+    });
+    const got = await getReminder(db, CHAT, sched.id); // снова pending
+    assertEquals(new Date(got!.remind_at).getTime(), next.getTime());
+    assertEquals(got?.nag_sent, 0);
+
+    const once = await createReminder(db, {
+      chat_id: CHAT,
+      text: "разовое",
+      remind_at: FUTURE(),
+    });
+    assertEquals(await completeReminder(db, CHAT, once.id, () => next), {
+      text: "разовое",
+    });
+    assertEquals(await completeReminder(db, CHAT, once.id, () => next), null); // уже done
   },
 );

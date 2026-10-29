@@ -9,6 +9,7 @@ import {
   buildListMessage,
   buildReminderKeyboard,
   buildReminderMessage,
+  buildSeriesStoppedMessage,
   buildSnoozedMessage,
   buildStoppedMessage,
   decodeCallback,
@@ -458,4 +459,65 @@ Deno.test("callback: новые действия edit / etxt / etime / list ра
   assertEquals(decodeCallback("list:all"), { action: "list", id: "all" });
   assertEquals(decodeCallback("edit:"), null);
   assertEquals(decodeCallback("edit:a b"), null);
+});
+
+// --- Повторы по расписанию ---------------------------------------------------
+
+const WD_RULE = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0";
+
+Deno.test("карточка с расписанием: строка «📆 Повторяется …», кнопки как обычно", () => {
+  const card = buildConfirmCard({
+    text: "зарядка",
+    remindAt: new Date("2026-10-29T06:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+    rrule: WD_RULE,
+  });
+  assertEquals(
+    card.text,
+    "Напомню <b>29.10 в 09:00</b>: зарядка\n📆 Повторяется по будням в 09:00",
+  );
+  assertEquals(card.reply_markup.inline_keyboard[0][0].text, "✅ OK");
+});
+
+Deno.test("/list: у напоминания с расписанием отметка 📆", () => {
+  const msg = buildListMessage(
+    [{
+      id: "id-1",
+      text: "зарядка",
+      remind_at: "2026-10-29T06:00:00Z",
+      rrule: WD_RULE,
+    }],
+    TZ,
+    NOW,
+  );
+  assertEquals(
+    msg.text,
+    "Твои напоминания:\n1. 29.10 в 09:00 — зарядка 📆 по будням в 09:00",
+  );
+});
+
+Deno.test("кнопки у повторяющегося: добавляется «⛔ Прекратить повторы»", () => {
+  assertEquals(buildReminderKeyboard("rem-1", { repeating: true }), {
+    inline_keyboard: [
+      [
+        { text: "+10 мин", callback_data: "snz:rem-1:10" },
+        { text: "+1 час", callback_data: "snz:rem-1:60" },
+        { text: "Завтра", callback_data: "snz:rem-1:1440" },
+      ],
+      [
+        { text: "✅ Готово", callback_data: "done:rem-1" },
+        { text: "⛔ Прекратить повторы", callback_data: "stop:rem-1" },
+      ],
+    ],
+  });
+  assertEquals(decodeCallback("stop:abc"), { action: "stop", id: "abc" });
+});
+
+Deno.test("сообщения про расписание: «Готово» и «Повторы прекращены»", () => {
+  assertEquals(
+    buildSeriesStoppedMessage("a < b"),
+    "⛔ <b>Повторы прекращены</b>\na &lt; b",
+  );
 });

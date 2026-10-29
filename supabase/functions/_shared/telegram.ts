@@ -9,6 +9,7 @@
 // символы < > & в его тексте сломают разметку или Telegram отклонит сообщение.
 
 import { localParts } from "./parser/tz.ts";
+import { describeRrule } from "./repeat.ts";
 
 // --- Типы кнопок -------------------------------------------------------------
 // Inline-кнопка — кнопка прямо под сообщением. Когда её нажимают, Telegram присылает боту
@@ -25,6 +26,7 @@ export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 //   etxt  — править текст     etime — править время
 //   list  — вернуться к списку
 //   snz   — отложить сработавшее напоминание (минуты; 1440 = «завтра»)
+//   stop  — прекратить повторы по расписанию
 //   dtxt  — править текст на карточке подтверждения (до «OK»)
 export type CallbackAction =
   | "ok"
@@ -39,7 +41,8 @@ export type CallbackAction =
   | "etime"
   | "list"
   | "dtxt"
-  | "snz";
+  | "snz"
+  | "stop";
 
 // «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
 // (считая первое), пока пользователь не нажмёт «Готово».
@@ -58,6 +61,7 @@ export type ListItem = {
   nag_interval_min?: number | null;
   nag_total?: number | null;
   nag_sent?: number;
+  rrule?: string | null; // расписание («по будням в 09:00»), если напоминание повторяется
 };
 
 const MAX_LIST_ITEMS = 20; // в одном сообщении показываем не больше 20 напоминаний
@@ -126,7 +130,7 @@ export function decodeCallback(
   data: string,
 ): { action: CallbackAction; id: string; arg?: number } | null {
   const plain =
-    /^(ok|other|del|done|rep|edit|etxt|etime|list|dtxt):([A-Za-z0-9_-]{1,60})$/
+    /^(ok|other|del|done|rep|edit|etxt|etime|list|dtxt|stop):([A-Za-z0-9_-]{1,60})$/
       .exec(
         data,
       );
@@ -155,6 +159,7 @@ export function buildConfirmCard(a: {
   now: Date;
   adjusted?: "tomorrow";
   nag?: Nag | null;
+  rrule?: string | null; // расписание повторов, если есть
 }): { text: string; reply_markup: InlineKeyboardMarkup } {
   const when = formatWhen(a.remindAt, a.timezone, a.now);
   const note = a.adjusted === "tomorrow"
@@ -164,6 +169,7 @@ export function buildConfirmCard(a: {
     encodeCallback({ action, id: a.draftId, arg });
 
   let text = `${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`;
+  if (a.rrule) text += `\n📆 Повторяется ${describeRrule(a.rrule)}`;
   const rows: InlineButton[][] = [[
     { text: "✅ OK", callback_data: cb("ok") },
     { text: "🕐 Другое время", callback_data: cb("other") },
@@ -208,6 +214,7 @@ export function buildListMessage(
     let line = `${i + 1}. ${formatWhen(new Date(it.remind_at), tz, now)} — ${
       escapeHtml(it.text)
     }`;
+    if (it.rrule) line += ` 📆 ${describeRrule(it.rrule)}`;
     // У напоминаний с повтором — отметка 🔁 и сколько сообщений серии уже ушло.
     if (it.nag_interval_min && it.nag_total) {
       line += ` 🔁 каждые ${
@@ -283,6 +290,7 @@ export const SNOOZE_OPTIONS = [10, 60, SNOOZE_TOMORROW];
 // Кнопки под сработавшим напоминанием: отложить или «Готово» (останавливает серию повторов).
 export function buildReminderKeyboard(
   reminderId: string,
+  opts: { repeating?: boolean } = {},
 ): InlineKeyboardMarkup {
   const snz = (arg: number, text: string): InlineButton => ({
     text,
@@ -291,10 +299,20 @@ export function buildReminderKeyboard(
   return {
     inline_keyboard: [
       [snz(10, "+10 мин"), snz(60, "+1 час"), snz(SNOOZE_TOMORROW, "Завтра")],
-      [{
-        text: "✅ Готово",
-        callback_data: encodeCallback({ action: "done", id: reminderId }),
-      }],
+      [
+        {
+          text: "✅ Готово",
+          callback_data: encodeCallback({ action: "done", id: reminderId }),
+        },
+        // У напоминания по расписанию «Готово» закрывает только это срабатывание,
+        // а закончить всё расписание можно отдельной кнопкой.
+        ...(opts.repeating
+          ? [{
+            text: "⛔ Прекратить повторы",
+            callback_data: encodeCallback({ action: "stop", id: reminderId }),
+          }]
+          : []),
+      ],
     ],
   };
 }
@@ -302,6 +320,11 @@ export function buildReminderKeyboard(
 // Во что превращается сообщение после snooze («when» уже отформатировано для человека).
 export function buildSnoozedMessage(text: string, when: string): string {
   return `💤 <b>Отложено до ${when}</b>\n${escapeHtml(text)}`;
+}
+
+// Во что превращается сообщение после «⛔ Прекратить повторы».
+export function buildSeriesStoppedMessage(text: string): string {
+  return `⛔ <b>Повторы прекращены</b>\n${escapeHtml(text)}`;
 }
 
 // Во что превращается сообщение после нажатия «Готово».

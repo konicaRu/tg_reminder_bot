@@ -12,6 +12,7 @@
 import {
   claimDueReminders,
   createDb,
+  getSettings,
   markReminderSent,
   releaseReminder,
 } from "../_shared/db.ts";
@@ -38,6 +39,7 @@ const run = () =>
       markReminderSent: (id, messageId, next) =>
         markReminderSent(db, id, messageId, next),
       releaseReminder: (id) => releaseReminder(db, id),
+      getTimezone: async (chatId) => (await getSettings(db, chatId)).timezone,
     },
     send: (chatId, text, markup) =>
       sendTelegramMessage(botToken, chatId, text, fetch, markup),
