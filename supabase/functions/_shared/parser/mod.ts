@@ -151,6 +151,13 @@ function extractRepeat(s: string): RepeatFound | "unsupported" | null {
 const FILLER_RE =
   /^(?:напомни(?:те)?|напоминай(?:те)?)(?![\p{L}])(?:\s+мне(?![\p{L}]))?[\s,:-]*/iu;
 
+// То же слово в середине или в конце фразы («через минуту напомни позвонить»). Отдельное слово:
+// «напомнить», «напоминание» не задеваем.
+const FILLER_ANYWHERE_RE = new RegExp(
+  String.raw`${NB}(?:напомни(?:те)?|напоминай(?:те)?)${NA}(?:\s+мне${NA})?`,
+  "giu",
+);
+
 const HALF_HOUR_RE = new RegExp(`${NB}через\\s+полчаса${NA}`, "iu");
 const RELATIVE_RE = new RegExp(
   `${NB}через\\s+(?:(\\d+)\\s*)?(мин\\p{L}*|час\\p{L}*|ч${NA}|ден\\p{L}*|дн\\p{L}*|недел\\p{L}*)`,
@@ -198,8 +205,10 @@ export function parseReminder(input: string, opts: ParseOptions): ParseResult {
     if (m) s = s.slice(0, m.index) + " " + s.slice(m.index + m[0].length);
     return m;
   };
+  // Текст напоминания: «напомни» где бы оно ни стояло убираем, лишние пробелы и знаки по краям тоже.
   const cleanText = () =>
-    s.replace(/\s+/g, " ").replace(/^[\s,.:;–—-]+|[\s,;:–—-]+$/gu, "").trim();
+    s.replace(FILLER_ANYWHERE_RE, " ").replace(/\s+/g, " ")
+      .replace(/^[\s,.:;–—-]+|[\s,;:–—-]+$/gu, "").trim();
 
   const local = localParts(now, tz);
   const today: LocalDate = { y: local.y, m: local.m, d: local.d };
