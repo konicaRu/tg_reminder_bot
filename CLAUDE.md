@@ -24,7 +24,7 @@
 | Mini App (фаза 5) | Статическая страница на GitHub Pages + Telegram WebApp SDK | Нативный выбор даты на телефоне |
 | Тесты | `deno test` | Особенно для парсера дат |
 
-Внешние сервисы, кроме Telegram, Supabase и Groq, не добавлять без согласования.
+Внешние сервисы, кроме Telegram, Supabase, Groq и Gemini (запасная LLM, согласована), не добавлять без согласования.
 
 ## Архитектура
 ```
@@ -58,7 +58,7 @@ pg_cron (каждую минуту) ──► Edge Function `tick` → отпр�
 
 ## Безопасность
 - Секреты — только в Supabase Secrets, никогда в коде и в git. Файл `.env` — в `.gitignore`.
-- Список секретов: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`.
+- Список секретов: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `ALLOWED_USER_ID`, `GROQ_API_KEY`, `GROQ_LLM_MODEL`, `TICK_SECRET`; необязательные: `GEMINI_API_KEY`, `GEMINI_MODEL` (запасная LLM), `GROQ_STT_MODEL`.
 - Функция `bot` деплоится с `--no-verify-jwt` (Telegram не умеет слать JWT Supabase), поэтому обязательно проверяет заголовок `X-Telegram-Bot-Api-Secret-Token`.
 - Функция `tick` проверяет свой секрет `TICK_SECRET`.
 - Whitelist: на сообщения не от людей из `ALLOWED_USER_ID` (один id или несколько через запятую) бот не отвечает.

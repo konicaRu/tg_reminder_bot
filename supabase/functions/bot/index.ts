@@ -26,7 +26,9 @@ import {
   stopReminder,
   updateReminder,
 } from "../_shared/db.ts";
+import { parseWithGemini } from "../_shared/gemini.ts";
 import { parseWithLlm, transcribeAudio } from "../_shared/groq.ts";
+import { withFallback } from "../_shared/llm.ts";
 import { downloadTelegramFile } from "../_shared/telegram_api.ts";
 import { captionFor, isMediaMessage } from "../_shared/telegram.ts";
 import { parseReminder } from "../_shared/parser/mod.ts";
@@ -108,14 +110,28 @@ const transcribe = groqKey
   }
   : undefined;
 
+// Разбор сложных фраз нейросетью: основная Groq, запасная Gemini (включается только если Groq
+// недоступен и задан GEMINI_API_KEY). Любая из двух может быть не настроена.
+const geminiKey = Deno.env.get("GEMINI_API_KEY");
+const geminiModel = Deno.env.get("GEMINI_MODEL") ?? "gemini-3.5-flash-lite";
+const llm = withFallback(
+  groqKey && groqModel
+    ? (input, opts) =>
+      parseWithLlm(input, opts, { apiKey: groqKey, model: groqModel })
+    : undefined,
+  geminiKey
+    ? (input, opts) =>
+      parseWithGemini(input, opts, { apiKey: geminiKey, model: geminiModel })
+    : undefined,
+  // В лог только факт переключения: ни текст фразы, ни ключ туда не попадают.
+  () => console.error("Groq недоступен, пробуем Gemini"),
+);
+
 const handlers = createHandlers({
   store,
   transcribe,
   parse: parseReminder,
-  llm: groqKey && groqModel
-    ? (input, opts) =>
-      parseWithLlm(input, opts, { apiKey: groqKey, model: groqModel })
-    : undefined,
+  llm,
   now: () => new Date(),
   newId: () => crypto.randomUUID().slice(0, 8), // короткий код черновика
 });
