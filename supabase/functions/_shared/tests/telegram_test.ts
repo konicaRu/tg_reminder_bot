@@ -12,11 +12,14 @@ import {
   buildSeriesStoppedMessage,
   buildSnoozedMessage,
   buildStoppedMessage,
+  captionFor,
+  clipText,
   decodeCallback,
   DEFAULT_NAG,
   encodeCallback,
   escapeHtml,
   formatWhen,
+  isMediaMessage,
 } from "../telegram.ts";
 
 const TZ = "Europe/Moscow";
@@ -443,6 +446,7 @@ Deno.test("меню правки: что за напоминание и кноп
       { text: "✏️ Текст", callback_data: `etxt:${uuid}` },
       { text: "🕐 Время", callback_data: `etime:${uuid}` },
     ],
+    [{ text: "📎 Вложение", callback_data: `eatt:${uuid}` }],
     [{ text: "⬅️ К списку", callback_data: "list:all" }],
   ]);
   // Telegram принимает callback_data не длиннее 64 байт
@@ -537,4 +541,91 @@ Deno.test("карточка: для голосового первой строк
     card.text,
     "🎙 Я услышал: «завтра в 11 встреча &lt;b&gt;»\nНапомню <b>29.10 в 11:00</b>: встреча",
   );
+});
+
+// --- Вложения ----------------------------------------------------------------
+
+Deno.test("карточка с вложением: строка «📎 Вложение: фото/документ»", () => {
+  const base = {
+    text: "отдать",
+    remindAt: new Date("2026-10-29T07:00:00Z"),
+    draftId: "a1b2c3d4",
+    timezone: TZ,
+    now: NOW,
+  };
+  assertEquals(
+    buildConfirmCard({ ...base, attachment: { type: "photo", fileId: "F" } })
+      .text,
+    "Напомню <b>29.10 в 10:00</b>: отдать\n📎 Вложение: фото",
+  );
+  assertEquals(
+    buildConfirmCard({ ...base, attachment: { type: "document", fileId: "F" } })
+      .text.endsWith("📎 Вложение: документ"),
+    true,
+  );
+});
+
+Deno.test("/list: у напоминания с вложением отметка 📎", () => {
+  const msg = buildListMessage(
+    [{
+      id: "i1",
+      text: "отдать",
+      remind_at: "2026-10-29T07:00:00Z",
+      attachment_type: "photo",
+    }],
+    TZ,
+    NOW,
+  );
+  assertEquals(msg.text, "Твои напоминания:\n1. 29.10 в 10:00 — отдать 📎");
+});
+
+Deno.test("меню правки: кнопка «📎 Вложение» всегда; «🗑 Убрать вложение» только если оно есть", () => {
+  const without = buildEditMenu(
+    { id: "i1", text: "x", remind_at: "2026-10-29T07:00:00Z" },
+    TZ,
+    NOW,
+  );
+  const labels = (m: typeof without) =>
+    m.reply_markup.inline_keyboard.flat().map((b) => b.text);
+  assertEquals(labels(without).includes("📎 Вложение"), true);
+  assertEquals(labels(without).some((l) => l.includes("Убрать")), false);
+  const withAtt = buildEditMenu(
+    {
+      id: "i1",
+      text: "x",
+      remind_at: "2026-10-29T07:00:00Z",
+      attachment_type: "document",
+    },
+    TZ,
+    NOW,
+  );
+  assertEquals(labels(withAtt).includes("🗑 Убрать вложение"), true);
+  const data = withAtt.reply_markup.inline_keyboard.flat().map((b) =>
+    b.callback_data
+  );
+  assertEquals(data.includes("eatt:i1"), true);
+  assertEquals(data.includes("edel:i1"), true);
+  assertEquals(decodeCallback("eatt:i1"), { action: "eatt", id: "i1" });
+  assertEquals(decodeCallback("edel:i1"), { action: "edel", id: "i1" });
+});
+
+Deno.test("clipText: короткий текст не трогаем, длинный обрезаем с «…» до лимита", () => {
+  assertEquals(clipText("привет", 10), "привет");
+  assertEquals(clipText("а".repeat(20), 10), "ааааааааа…");
+  assertEquals(clipText("а".repeat(20), 10).length, 10);
+});
+
+Deno.test("isMediaMessage: фото/документ — да, обычный текст — нет", () => {
+  assertEquals(isMediaMessage({ photo: [{}] }), true);
+  assertEquals(isMediaMessage({ document: {} }), true);
+  assertEquals(isMediaMessage({ text: "привет" }), false);
+  assertEquals(isMediaMessage(undefined), false);
+});
+
+Deno.test("captionFor: до 1024 символов — как есть (HTML), длиннее — обычный обрезанный текст без тегов", () => {
+  assertEquals(captionFor("<b>ok</b>"), { text: "<b>ok</b>", html: true });
+  const long = captionFor("<b>" + "а".repeat(2000) + "</b>");
+  assertEquals(long.html, false);
+  assertEquals(long.text.length <= 1024, true);
+  assertEquals(long.text.includes("<"), false);
 });

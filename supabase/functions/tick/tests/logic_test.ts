@@ -50,9 +50,16 @@ function setup(
     claimThrows?: boolean;
     userStoppedFirst?: boolean; // пользователь нажал «Готово», пока шла отправка
     clearThrows?: boolean;
+    failSendWith?: string; // сообщение ошибки, когда уходит сообщение С вложением
+    failTextSend?: boolean; // обычная (без файла) отправка тоже падает
   } = {},
 ) {
-  const sentMessages: { chatId: number; text: string; markup?: unknown }[] = [];
+  const sentMessages: {
+    chatId: number;
+    text: string;
+    markup?: unknown;
+    attachment?: unknown;
+  }[] = [];
   const marked: {
     id: string;
     messageId: number;
@@ -63,6 +70,7 @@ function setup(
     [];
   const logs: string[] = [];
   let claimCalls = 0;
+  let sendCalls = 0;
   let messageCounter = 100;
 
   const store: TickStore = {
@@ -83,14 +91,29 @@ function setup(
     getTimezone: () => Promise.resolve("Europe/Moscow"),
   };
 
-  const send = (chatId: number, text: string, markup?: unknown) => {
+  const send = (
+    chatId: number,
+    text: string,
+    markup?: unknown,
+    attachment?: unknown,
+  ) => {
+    sendCalls++;
+    if (opts.failSendWith && attachment) {
+      return Promise.reject(new Error(opts.failSendWith));
+    }
+    if (opts.failTextSend && !attachment) {
+      return Promise.reject(new Error("Telegram: 500"));
+    }
     if (opts.failSendFor?.some((t) => text.includes(t))) {
       return Promise.reject(new Error("Telegram: 500"));
     }
     // поле markup записываем только если кнопки были: так проще сравнивать с ожидаемым
-    sentMessages.push(
-      markup === undefined ? { chatId, text } : { chatId, text, markup },
-    );
+    sentMessages.push({
+      chatId,
+      text,
+      ...(markup === undefined ? {} : { markup }),
+      ...(attachment === undefined ? {} : { attachment }),
+    });
     return Promise.resolve(++messageCounter);
   };
 
@@ -117,6 +140,7 @@ function setup(
     cleared,
     logs,
     claimCalls: () => claimCalls,
+    sendCalls: () => sendCalls,
   };
 }
 
@@ -503,5 +527,93 @@ Deno.test("расписание: часовой пояс берём из нас�
   assertEquals(
     t.marked[0].next.nextRemindAt,
     new Date("2026-10-30T04:00:00Z"),
+  );
+});
+
+// =============================================================================
+// Вложения (фото / документ)
+// =============================================================================
+
+const withFile = (id: string, extra: Partial<Reminder> = {}): Reminder => ({
+  ...rem(id, 555, "отдать документ"),
+  attachment_file_id: "AgAD-photo",
+  attachment_type: "photo",
+  ...extra,
+});
+
+Deno.test("вложение: приходит файл с подписью и теми же кнопками", async () => {
+  const t = setup([withFile("a1")]);
+  const summary = await runTick(t.deps);
+  assertEquals(t.sentMessages, [{
+    chatId: 555,
+    text: "⏰ <b>Напоминание</b>\nотдать документ",
+    markup: doneButton("a1"),
+    attachment: { type: "photo", fileId: "AgAD-photo" },
+  }]);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+});
+
+Deno.test("вложение: документ передаётся с типом document", async () => {
+  const t = setup([
+    withFile("a1", { attachment_type: "document", attachment_file_id: "BQAD" }),
+  ]);
+  await runTick(t.deps);
+  assertEquals(t.sentMessages[0].attachment, {
+    type: "document",
+    fileId: "BQAD",
+  });
+});
+
+Deno.test("вложение: длинный текст обрезается, чтобы подпись влезла в лимит Telegram (1024)", async () => {
+  const t = setup([withFile("a1", { text: "а".repeat(3000) })]);
+  await runTick(t.deps);
+  assertEquals(t.sentMessages[0].text.length <= 1024, true);
+  assertEquals(t.sentMessages[0].text.endsWith("…"), true);
+});
+
+Deno.test("вложение: без файла длинный текст не трогаем", async () => {
+  const t = setup([rem("r1", 555, "а".repeat(3000))]);
+  await runTick(t.deps);
+  assertEquals(t.sentMessages[0].text.length > 1024, true);
+});
+
+Deno.test("вложение: файл недоступен (Telegram 400) → напоминание приходит текстом с пометкой, не теряется", async () => {
+  const t = setup([withFile("a1")], {
+    failSendWith: "Telegram: 400 Bad Request: wrong file identifier",
+  });
+  const summary = await runTick(t.deps);
+  assertEquals(summary, { claimed: 1, sent: 1, failed: 0 });
+  assertEquals(t.sentMessages.length, 1);
+  assertEquals(t.sentMessages[0].attachment, undefined);
+  assertEquals(t.sentMessages[0].text.includes("вложение недоступно"), true);
+  assertEquals(t.sentMessages[0].text.includes("отдать документ"), true);
+  assertEquals(t.marked.length, 1);
+});
+
+Deno.test("вложение: сбой сети/сервера → возврат в очередь без запасной отправки (иначе возможен дубль)", async () => {
+  const t = setup([withFile("a1")], { failSendWith: "Telegram: 500 oops" });
+  const summary = await runTick(t.deps);
+  assertEquals(summary, { claimed: 1, sent: 0, failed: 1 });
+  assertEquals(t.sendCalls(), 1); // вторую попытку текстом не делали
+  assertEquals(t.released, ["a1"]);
+});
+
+Deno.test("вложение: файл недоступен и запасная отправка тоже упала → в очередь", async () => {
+  const t = setup([withFile("a1")], {
+    failSendWith: "Telegram: 400 Bad Request: wrong file identifier",
+    failTextSend: true,
+  });
+  const summary = await runTick(t.deps);
+  assertEquals(summary, { claimed: 1, sent: 0, failed: 1 });
+  assertEquals(t.released, ["a1"]);
+});
+
+Deno.test("вложение + расписание: файл едет и на следующее срабатывание (поле не очищается)", async () => {
+  const t = setup([withFile("a1", { rrule: DAILY9 })]);
+  await runTick(t.deps);
+  assertEquals(t.sentMessages[0].markup, schedButtons("a1"));
+  assertEquals(
+    t.marked[0].next.nextRemindAt,
+    new Date("2026-10-30T06:00:00Z"),
   );
 });

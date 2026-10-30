@@ -453,3 +453,34 @@ dbTest(
     assertEquals(await completeReminder(db, CHAT, once.id, () => next), null); // уже done
   },
 );
+
+dbTest(
+  "вложение: createReminder сохраняет file_id и тип; updateReminder заменяет и убирает (null)",
+  async (db) => {
+    const r = await createReminder(db, {
+      chat_id: CHAT,
+      text: "с файлом",
+      remind_at: FUTURE(),
+      attachment: { type: "photo", fileId: "AgAD-1" },
+    });
+    assertEquals(r.attachment_file_id, "AgAD-1");
+    assertEquals(r.attachment_type, "photo");
+    assertEquals(
+      await updateReminder(db, CHAT, r.id, {
+        attachment: { type: "document", fileId: "BQAD-2" },
+      }),
+      true,
+    );
+    let got = await getReminder(db, CHAT, r.id);
+    assertEquals([got?.attachment_type, got?.attachment_file_id], [
+      "document",
+      "BQAD-2",
+    ]);
+    assertEquals(
+      await updateReminder(db, CHAT, r.id, { attachment: null }),
+      true,
+    );
+    got = await getReminder(db, CHAT, r.id);
+    assertEquals([got?.attachment_type, got?.attachment_file_id], [null, null]);
+  },
+);

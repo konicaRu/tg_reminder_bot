@@ -16,6 +16,7 @@ import type {
 } from "../_shared/parser/mod.ts";
 import type { Reminder, Session, Settings } from "../_shared/db.ts";
 import {
+  type Attachment,
   buildConfirmCard,
   buildEditMenu,
   buildListMessage,
@@ -58,6 +59,7 @@ export type Store = {
       remind_at: Date;
       rrule: string | null;
       nag: Nag | null; // серия повторов или null (обычное напоминание)
+      attachment?: Attachment | null; // приложенное фото/документ
     },
   ): Promise<Reminder>;
   listPendingReminders(chatId: number): Promise<Reminder[]>;
@@ -83,7 +85,12 @@ export type Store = {
   updateReminder(
     chatId: number,
     id: string,
-    patch: { text?: string; remind_at?: Date; rrule?: string },
+    patch: {
+      text?: string;
+      remind_at?: Date;
+      rrule?: string;
+      attachment?: Attachment | null;
+    },
   ): Promise<boolean>;
 };
 
@@ -174,6 +181,11 @@ const MSG = {
   repeat:
     "Такие повторы пока умею только: каждый день, по будням, по выходным " +
     "и по дням недели.\nНапример: «каждый будний день в 9 зарядка».",
+  attachAsk:
+    "📎 Получил. Когда и о чём напомнить? Например: «завтра в 10 отдать».",
+  attachSendFile: "Пришли фото или файл (или нажми «К списку» в меню).",
+  attachUpdated: "✅ Вложение обновлено.",
+  attachRemoved: "🗑 Вложение убрано.",
   voiceOff: "Голос сейчас недоступен, напиши текстом.",
   voiceLong: "Голосовое длиннее минуты. Запиши покороче или напиши текстом.",
   voiceFail: "Не удалось разобрать голосовое, напиши текстом.",
@@ -195,6 +207,8 @@ function failureMessage(reason: ParseFailReason): string {
 // --- Состояния диалога (поле state в таблице sessions) ------------------------
 const CONFIRM = "confirm"; // показали карточку, ждём «OK»
 const AWAITING_TIME = "awaiting_time"; // нажали «Другое время», ждём новое время текстом
+const ATTACH_WAIT = "attach_wait"; // прислали файл без подписи, ждём «когда и о чём»
+const EDIT_ATTACH = "edit_attach"; // нажали «📎 Вложение» в меню правки, ждём файл
 const DRAFT_TEXT = "draft_text"; // нажали «✏️ Текст» на карточке (до OK), ждём новый текст
 const EDIT_TEXT = "edit_text"; // нажали «✏️ Текст» в меню правки, ждём новый текст
 const EDIT_TIME = "edit_time"; // нажали «🕐 Время» в меню правки, ждём новое время
@@ -207,6 +221,7 @@ type Draft = {
   adjusted: "tomorrow" | null;
   nag: Nag | null; // «🔁 Повторять»: настройки серии повторов, null = выключено
   rrule?: string | null; // расписание («каждый будний день в 9»), null/нет = разовое
+  attachment?: Attachment | null; // приложенное фото/документ
 };
 
 export function createHandlers(deps: Deps) {
@@ -234,6 +249,7 @@ export function createHandlers(deps: Deps) {
       nag: draft.nag,
       rrule: draft.rrule,
       heard,
+      attachment: draft.attachment,
     });
   }
 
@@ -245,6 +261,7 @@ export function createHandlers(deps: Deps) {
     opts: ParseOptions,
     nag: Nag | null = null,
     heard?: string, // распознанный голос: показываем на новой карточке
+    attachment: Attachment | null = null,
   ): Promise<void> {
     const draft: Draft = {
       id: deps.newId(),
@@ -253,6 +270,7 @@ export function createHandlers(deps: Deps) {
       adjusted: res.adjusted ?? null,
       nag,
       rrule: res.rrule,
+      attachment,
     };
     await store.setSession(io.chatId, CONFIRM, draft);
     const card = cardFor(draft, opts, heard);
@@ -280,6 +298,8 @@ export function createHandlers(deps: Deps) {
       res,
       opts,
       (payload.nag as Nag | null | undefined) ?? null,
+      undefined,
+      (payload.attachment as Attachment | null | undefined) ?? null,
     );
   }
 
@@ -364,9 +384,19 @@ export function createHandlers(deps: Deps) {
 
     // Обычное текстовое сообщение.
     // heard — этот текст на самом деле распознан из голосового (показываем «🎙 Я услышал»).
-    async text(io: Io, input: string, heard?: string): Promise<void> {
+    async text(
+      io: Io,
+      input: string,
+      heard?: string,
+      captionAttachment?: Attachment,
+    ): Promise<void> {
       const opts = await parseOptions(io.chatId);
       const session = await store.getSession(io.chatId);
+      // Файл прислали раньше без подписи: этот текст становится его подписью.
+      const attachment: Attachment | null = captionAttachment ??
+        (session?.state === ATTACH_WAIT
+          ? (session.payload.attachment as Attachment)
+          : null);
       if (session?.state === DRAFT_TEXT) {
         const text = input.trim();
         if (!text) {
@@ -382,6 +412,7 @@ export function createHandlers(deps: Deps) {
         const card = cardFor(draft, opts);
         return io.reply(card.text, card.reply_markup);
       }
+      if (session?.state === EDIT_ATTACH) return io.reply(MSG.attachSendFile);
       if (session?.state === EDIT_TEXT || session?.state === EDIT_TIME) {
         return onEdit(io, session.state, session.payload, input);
       }
@@ -399,7 +430,41 @@ export function createHandlers(deps: Deps) {
         const prefix = heard !== undefined ? heardLine(heard) : "";
         return io.reply(prefix + failureMessage(res.reason));
       }
-      return showCard(io, res, opts, null, heard);
+      if (session?.state === ATTACH_WAIT) await store.clearSession(io.chatId);
+      return showCard(io, res, opts, null, heard, attachment);
+    },
+
+    // Фото или документ (подпись caption необязательна).
+    async attachment(
+      io: Io,
+      a: { type: Attachment["type"]; fileId: string; caption?: string },
+    ): Promise<void> {
+      const file: Attachment = { type: a.type, fileId: a.fileId };
+      const session = await store.getSession(io.chatId);
+
+      // Правка: новый файл заменяет прежнее вложение напоминания.
+      if (session?.state === EDIT_ATTACH) {
+        const ok = await store.updateReminder(
+          io.chatId,
+          String(session.payload.reminderId ?? ""),
+          { attachment: file },
+        );
+        await store.clearSession(io.chatId);
+        if (!ok) return io.reply(MSG.editTooLate);
+        return io.reply(MSG.attachUpdated, {
+          inline_keyboard: [[{
+            text: "📋 К списку",
+            callback_data: encodeCallback({ action: "list", id: "all" }),
+          }]],
+        });
+      }
+
+      const caption = a.caption?.trim();
+      if (caption) return this.text(io, caption, undefined, file);
+
+      // Без подписи: запоминаем файл и спрашиваем, когда и о чём напомнить.
+      await store.setSession(io.chatId, ATTACH_WAIT, { attachment: file });
+      return io.reply(MSG.attachAsk);
     },
 
     // Голосовое сообщение: распознаём и дальше ведём как обычный текст.
@@ -447,6 +512,31 @@ export function createHandlers(deps: Deps) {
         }
         const msg = await listFor(io.chatId);
         await io.edit(msg.text, msg.reply_markup);
+        return io.answer();
+      }
+      if (c.action === "eatt" || c.action === "edel") {
+        const r = await store.getReminder(io.chatId, c.id);
+        if (!r) return io.answer(MSG.editGone);
+        if (c.action === "eatt") {
+          await store.setSession(io.chatId, EDIT_ATTACH, { reminderId: r.id });
+          await io.edit(
+            `Пришли фото или файл для: «${escapeHtml(r.text)}»\n` +
+              "Он заменит текущее вложение.",
+          );
+          return io.answer();
+        }
+        const ok = await store.updateReminder(io.chatId, r.id, {
+          attachment: null,
+        });
+        if (!ok) return io.answer(MSG.editGone);
+        const settings = await store.getSettings(io.chatId);
+        const fresh = await store.getReminder(io.chatId, r.id);
+        const menu = buildEditMenu(
+          fresh ?? { ...r, attachment_type: null },
+          settings.timezone,
+          deps.now(),
+        );
+        await io.edit(MSG.attachRemoved + "\n" + menu.text, menu.reply_markup);
         return io.answer();
       }
       if (c.action === "edit" || c.action === "etxt" || c.action === "etime") {
@@ -534,11 +624,17 @@ export function createHandlers(deps: Deps) {
           remind_at: remindAt,
           rrule: draft.rrule ?? null,
           nag,
+          attachment: draft.attachment ?? null,
         });
         await store.clearSession(io.chatId); // повторное нажатие уже не найдёт черновик → дубля нет
         const when = formatWhen(remindAt, settings.timezone, deps.now());
         await io.edit(
           `✅ Готово! Напомню <b>${when}</b>: ${escapeHtml(draft.text)}` +
+            (draft.attachment
+              ? `\n📎 Вложение: ${
+                draft.attachment.type === "photo" ? "фото" : "документ"
+              }`
+              : "") +
             (draft.rrule
               ? `\n📆 Повторяется ${describeRrule(draft.rrule)}`
               : "") +
@@ -590,6 +686,7 @@ export function createHandlers(deps: Deps) {
         draftId: draft.id,
         text: draft.text,
         nag: draft.nag ?? null, // при смене времени настройки повтора не теряем
+        attachment: draft.attachment ?? null,
       });
       await io.edit(
         `Меняем время для: «${escapeHtml(draft.text)}»\n` +

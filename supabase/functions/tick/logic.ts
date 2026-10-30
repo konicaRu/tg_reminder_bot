@@ -8,8 +8,10 @@
 import type { Reminder } from "../_shared/db.ts";
 import { nextOccurrence } from "../_shared/repeat.ts";
 import {
+  type Attachment,
   buildReminderKeyboard,
   buildReminderMessage,
+  clipText,
   type InlineKeyboardMarkup,
 } from "../_shared/telegram.ts";
 
@@ -31,10 +33,12 @@ export type TickStore = {
 export type TickDeps = {
   store: TickStore;
   // Отправить сообщение в Telegram (с кнопками или без), вернуть id отправленного сообщения.
+  // attachment — фото/документ: тогда это отправка файла с подписью text.
   send: (
     chatId: number,
     text: string,
     markup?: InlineKeyboardMarkup,
+    attachment?: Attachment,
   ) => Promise<number>;
   // Убрать кнопки у уже отправленного сообщения (необязательно: без него просто не убираем).
   clearKeyboard?: (chatId: number, messageId: number) => Promise<void>;
@@ -63,14 +67,42 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
     const isNag = interval != null && total != null;
     const index = (r.nag_sent ?? 0) + 1; // номер сообщения, которое отправляем сейчас
 
+    // Вложение (фото/документ) приходит вместе с напоминанием. Подпись к файлу у Telegram
+    // ограничена 1024 символами, поэтому текст режем заранее (до разметки).
+    const attachment: Attachment | undefined =
+      // «voice» в схеме зарезервирован под будущее; пока отправляем только фото и документы
+      r.attachment_file_id &&
+        (r.attachment_type === "photo" || r.attachment_type === "document")
+        ? { type: r.attachment_type, fileId: r.attachment_file_id }
+        : undefined;
+    const progress = isNag ? { index, total } : undefined;
+    // snooze и «Готово» у любого напоминания; у расписания ещё «Прекратить повторы»
+    const keyboard = buildReminderKeyboard(r.id, { repeating: !!r.rrule });
+
     let messageId: number;
     try {
-      messageId = await deps.send(
-        r.chat_id,
-        buildReminderMessage(r.text, isNag ? { index, total } : undefined),
-        // snooze и «Готово» у любого напоминания; у расписания ещё «Прекратить повторы»
-        buildReminderKeyboard(r.id, { repeating: !!r.rrule }),
-      );
+      try {
+        messageId = await deps.send(
+          r.chat_id,
+          buildReminderMessage(
+            attachment ? clipText(r.text, CAPTION_TEXT_MAX) : r.text,
+            progress,
+          ),
+          keyboard,
+          attachment,
+        );
+      } catch (err) {
+        // Файл пропал из Telegram (ошибка 400): напоминание всё равно должно прийти,
+        // поэтому шлём его обычным текстом с пометкой. Другие сбои (сеть, 5xx, лимиты) так не
+        // обходим: сообщение могло дойти, и запасная отправка дала бы дубль.
+        if (!attachment || !isFileGone(err)) throw err;
+        log(`Вложение напоминания ${r.id} недоступно, шлём текстом`);
+        messageId = await deps.send(
+          r.chat_id,
+          buildReminderMessage(r.text, progress) + "\n(вложение недоступно)",
+          keyboard,
+        );
+      }
     } catch (err) {
       failed++;
       // В лог пишем id и причину, но НЕ текст напоминания: он может быть личным.
@@ -156,6 +188,14 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
   }
 
   return { claimed: due.length, sent, failed };
+}
+
+// Текст для подписи к файлу: запас под заголовок «⏰ Напоминание (k из N)» и разметку.
+const CAPTION_TEXT_MAX = 900;
+
+// Telegram ответил 400 на отправку файла: обычно file_id больше не действует.
+function isFileGone(err: unknown): boolean {
+  return errorMessage(err).includes("Telegram: 400");
 }
 
 function errorMessage(err: unknown): string {

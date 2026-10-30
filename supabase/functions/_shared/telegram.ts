@@ -27,6 +27,7 @@ export type InlineKeyboardMarkup = { inline_keyboard: InlineButton[][] };
 //   list  — вернуться к списку
 //   snz   — отложить сработавшее напоминание (минуты; 1440 = «завтра»)
 //   stop  — прекратить повторы по расписанию
+//   eatt  — прислать новое вложение к напоминанию  edel — убрать вложение
 //   dtxt  — править текст на карточке подтверждения (до «OK»)
 export type CallbackAction =
   | "ok"
@@ -42,7 +43,15 @@ export type CallbackAction =
   | "list"
   | "dtxt"
   | "snz"
-  | "stop";
+  | "stop"
+  | "eatt"
+  | "edel";
+
+// Вложение к напоминанию: храним только file_id (файл лежит в Telegram), тип нужен,
+// чтобы выбрать метод отправки (sendPhoto / sendDocument).
+export type Attachment = { type: "photo" | "document"; fileId: string };
+
+const ATTACHMENT_NAMES = { photo: "фото", document: "документ" } as const;
 
 // «Настойчивое» напоминание: повторять каждые intervalMin минут, всего total сообщений
 // (считая первое), пока пользователь не нажмёт «Готово».
@@ -62,6 +71,7 @@ export type ListItem = {
   nag_total?: number | null;
   nag_sent?: number;
   rrule?: string | null; // расписание («по будням в 09:00»), если напоминание повторяется
+  attachment_type?: string | null; // «photo» / «document», если к напоминанию приложен файл
 };
 
 const MAX_LIST_ITEMS = 20; // в одном сообщении показываем не больше 20 напоминаний
@@ -130,7 +140,7 @@ export function decodeCallback(
   data: string,
 ): { action: CallbackAction; id: string; arg?: number } | null {
   const plain =
-    /^(ok|other|del|done|rep|edit|etxt|etime|list|dtxt|stop):([A-Za-z0-9_-]{1,60})$/
+    /^(ok|other|del|done|rep|edit|etxt|etime|list|dtxt|stop|eatt|edel):([A-Za-z0-9_-]{1,60})$/
       .exec(
         data,
       );
@@ -166,6 +176,7 @@ export function buildConfirmCard(a: {
   nag?: Nag | null;
   rrule?: string | null; // расписание повторов, если есть
   heard?: string; // распознанный текст голосового: показываем первой строкой
+  attachment?: Attachment | null; // приложенное фото/документ
 }): { text: string; reply_markup: InlineKeyboardMarkup } {
   const when = formatWhen(a.remindAt, a.timezone, a.now);
   const note = a.adjusted === "tomorrow"
@@ -176,6 +187,9 @@ export function buildConfirmCard(a: {
 
   const heard = a.heard !== undefined ? heardLine(a.heard) : "";
   let text = `${heard}${note}Напомню <b>${when}</b>: ${escapeHtml(a.text)}`;
+  if (a.attachment) {
+    text += `\n📎 Вложение: ${ATTACHMENT_NAMES[a.attachment.type]}`;
+  }
   if (a.rrule) text += `\n📆 Повторяется ${describeRrule(a.rrule)}`;
   const rows: InlineButton[][] = [[
     { text: "✅ OK", callback_data: cb("ok") },
@@ -222,6 +236,7 @@ export function buildListMessage(
       escapeHtml(it.text)
     }`;
     if (it.rrule) line += ` 📆 ${describeRrule(it.rrule)}`;
+    if (it.attachment_type) line += " 📎";
     // У напоминаний с повтором — отметка 🔁 и сколько сообщений серии уже ушло.
     if (it.nag_interval_min && it.nag_total) {
       line += ` 🔁 каждые ${
@@ -270,6 +285,18 @@ export function buildEditMenu(
             text: "🕐 Время",
             callback_data: encodeCallback({ action: "etime", id: item.id }),
           },
+        ],
+        [
+          {
+            text: "📎 Вложение",
+            callback_data: encodeCallback({ action: "eatt", id: item.id }),
+          },
+          ...(item.attachment_type
+            ? [{
+              text: "🗑 Убрать вложение",
+              callback_data: encodeCallback({ action: "edel", id: item.id }),
+            }]
+            : []),
         ],
         [{
           text: "⬅️ К списку",
@@ -337,4 +364,31 @@ export function buildSeriesStoppedMessage(text: string): string {
 // Во что превращается сообщение после нажатия «Готово».
 export function buildStoppedMessage(text: string): string {
   return `✅ <b>Готово</b>\n${escapeHtml(text)}`;
+}
+
+// --- Сообщения с вложением ---------------------------------------------------
+
+// Лимит подписи к фото/документу в Telegram — 1024 символа. Текст напоминания для подписи
+// режем заранее (до разметки), иначе можно разорвать HTML-тег посередине.
+export function clipText(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+// Это сообщение с медиа (фото, документ…)? У такого нет «текста», только подпись, поэтому
+// менять его нужно через editMessageCaption, а не editMessageText.
+export function isMediaMessage(m: unknown): boolean {
+  if (!m || typeof m !== "object") return false;
+  const o = m as Record<string, unknown>;
+  return ["photo", "document", "video", "animation", "audio", "voice"].some(
+    (k) => o[k] !== undefined,
+  );
+}
+
+// Подпись для editMessageCaption: если вместе с разметкой не влезает в 1024 символа,
+// отдаём обычный обрезанный текст без тегов (html: false), чтобы не сломать разметку.
+export function captionFor(text: string): { text: string; html: boolean } {
+  if (text.length <= 1024) return { text, html: true };
+  const plain = text.replace(/<[^>]*>/g, "").replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">").replaceAll("&amp;", "&");
+  return { text: clipText(plain, 1024).replaceAll("<", "‹"), html: false };
 }

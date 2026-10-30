@@ -18,6 +18,7 @@ import {
 } from "../_shared/db.ts";
 import {
   clearInlineKeyboard,
+  sendTelegramMedia,
   sendTelegramMessage,
 } from "../_shared/telegram_api.ts";
 import { handleRequest, runTick } from "./logic.ts";
@@ -41,8 +42,10 @@ const run = () =>
       releaseReminder: (id) => releaseReminder(db, id),
       getTimezone: async (chatId) => (await getSettings(db, chatId)).timezone,
     },
-    send: (chatId, text, markup) =>
-      sendTelegramMessage(botToken, chatId, text, fetch, markup),
+    send: (chatId, text, markup, attachment) =>
+      attachment
+        ? sendTelegramMedia(botToken, chatId, attachment, text, markup)
+        : sendTelegramMessage(botToken, chatId, text, fetch, markup),
     clearKeyboard: (chatId, messageId) =>
       clearInlineKeyboard(botToken, chatId, messageId),
     log: (message) => console.error(message),

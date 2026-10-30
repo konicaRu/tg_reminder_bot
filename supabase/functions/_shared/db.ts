@@ -134,6 +134,8 @@ export async function createReminder(
     rrule?: string | null;
     // повторять каждые intervalMin минут, всего total сообщений (см. миграцию nag_repeat)
     nag?: { intervalMin: number; total: number } | null;
+    // приложенное фото/документ: храним только file_id (файл лежит в Telegram)
+    attachment?: { type: "photo" | "document"; fileId: string } | null;
   },
 ): Promise<Reminder> {
   return check(
@@ -144,6 +146,8 @@ export async function createReminder(
       rrule: r.rrule ?? null,
       nag_interval_min: r.nag?.intervalMin ?? null,
       nag_total: r.nag?.total ?? null,
+      attachment_file_id: r.attachment?.fileId ?? null,
+      attachment_type: r.attachment?.type ?? null,
     }).select().single(),
     "создание напоминания",
   ) as Reminder;
@@ -188,12 +192,24 @@ export async function updateReminder(
   db: Db,
   chatId: number,
   id: string,
-  patch: { text?: string; remind_at?: Date; rrule?: string },
+  // attachment: новое вложение или null, чтобы убрать
+  patch: {
+    text?: string;
+    remind_at?: Date;
+    rrule?: string;
+    attachment?: { type: "photo" | "document"; fileId: string } | null;
+  },
 ): Promise<boolean> {
   const rows = check(
     await db.from("reminders").update({
       ...(patch.text !== undefined ? { text: patch.text } : {}),
       ...(patch.rrule !== undefined ? { rrule: patch.rrule } : {}),
+      ...(patch.attachment !== undefined
+        ? {
+          attachment_file_id: patch.attachment?.fileId ?? null,
+          attachment_type: patch.attachment?.type ?? null,
+        }
+        : {}),
       ...(patch.remind_at
         ? { remind_at: patch.remind_at.toISOString(), nag_sent: 0 }
         : {}),

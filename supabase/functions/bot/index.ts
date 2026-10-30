@@ -28,6 +28,7 @@ import {
 } from "../_shared/db.ts";
 import { parseWithLlm, transcribeAudio } from "../_shared/groq.ts";
 import { downloadTelegramFile } from "../_shared/telegram_api.ts";
+import { captionFor, isMediaMessage } from "../_shared/telegram.ts";
 import { parseReminder } from "../_shared/parser/mod.ts";
 import {
   createHandlers,
@@ -144,10 +145,20 @@ function ioFor(ctx: Context): Io {
     },
     edit: async (text, markup) => {
       try {
-        await ctx.editMessageText(text, {
-          parse_mode: "HTML",
-          reply_markup: markup,
-        });
+        // У сообщения с фото/документом нет «текста», только подпись: правим её.
+        if (isMediaMessage(ctx.callbackQuery?.message)) {
+          const cap = captionFor(text);
+          await ctx.editMessageCaption({
+            caption: cap.text,
+            ...(cap.html ? { parse_mode: "HTML" as const } : {}),
+            reply_markup: markup,
+          });
+        } else {
+          await ctx.editMessageText(text, {
+            parse_mode: "HTML",
+            reply_markup: markup,
+          });
+        }
       } catch (err) {
         // Telegram ругается, если новый текст совпал со старым. Для нас это не ошибка.
         if (
@@ -180,7 +191,27 @@ bot.on(
       duration: ctx.message.voice.duration,
     }),
 );
-bot.on("message", (ctx) => handlers.unsupported(ioFor(ctx))); // фото, файлы, стикеры…
+// Фото и документы. В альбоме (несколько фото сразу) каждое приходит отдельным сообщением:
+// берём то, у которого есть подпись, остальные молча пропускаем, иначе бот засыпал бы вопросами.
+bot.on("message:photo", (ctx) => {
+  const m = ctx.message;
+  if (m.media_group_id && !m.caption) return;
+  return handlers.attachment(ioFor(ctx), {
+    type: "photo",
+    fileId: m.photo[m.photo.length - 1].file_id, // последний размер — самый крупный
+    caption: m.caption,
+  });
+});
+bot.on("message:document", (ctx) => {
+  const m = ctx.message;
+  if (m.media_group_id && !m.caption) return;
+  return handlers.attachment(ioFor(ctx), {
+    type: "document",
+    fileId: m.document.file_id,
+    caption: m.caption,
+  });
+});
+bot.on("message", (ctx) => handlers.unsupported(ioFor(ctx))); // стикеры, видео…
 
 // Если что-то сломалось, логируем и отвечаем Telegram «ок». Иначе Telegram решит, что запрос
 // не дошёл, и будет присылать то же сообщение снова и снова. В лог пишем только текст ошибки.

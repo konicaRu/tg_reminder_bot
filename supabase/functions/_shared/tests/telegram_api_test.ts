@@ -7,6 +7,7 @@ import {
   callTelegramApi,
   clearInlineKeyboard,
   downloadTelegramFile,
+  sendTelegramMedia,
   sendTelegramMessage,
 } from "../telegram_api.ts";
 
@@ -282,4 +283,72 @@ Deno.test("скачивание файла: сбои getFile и сети не р
   );
   assertEquals(b.message.includes(TOKEN), false);
   assertEquals(b.message.includes("Telegram"), true);
+});
+
+// --- Отправка фото и документов по file_id -----------------------------------
+
+Deno.test("sendMedia: фото → sendPhoto с file_id, подписью (HTML) и кнопками; возвращает id", async () => {
+  const { fetchFn, calls } = fakeFetch(200, {
+    ok: true,
+    result: { message_id: 7 },
+  });
+  const markup = {
+    inline_keyboard: [[{ text: "✅ Готово", callback_data: "done:x" }]],
+  };
+  const id = await sendTelegramMedia(
+    TOKEN,
+    555,
+    { type: "photo", fileId: "AgAD-file" },
+    "<b>подпись</b>",
+    markup,
+    fetchFn,
+  );
+  assertEquals(id, 7);
+  assertEquals(calls[0].url, `https://api.telegram.org/bot${TOKEN}/sendPhoto`);
+  assertEquals(JSON.parse(calls[0].init.body as string), {
+    chat_id: 555,
+    photo: "AgAD-file",
+    caption: "<b>подпись</b>",
+    parse_mode: "HTML",
+    reply_markup: markup,
+  });
+});
+
+Deno.test("sendMedia: документ → sendDocument; без кнопок поле reply_markup не шлём", async () => {
+  const { fetchFn, calls } = fakeFetch(200, {
+    ok: true,
+    result: { message_id: 8 },
+  });
+  await sendTelegramMedia(
+    TOKEN,
+    555,
+    { type: "document", fileId: "BQAD" },
+    "текст",
+    undefined,
+    fetchFn,
+  );
+  assertEquals(calls[0].url.endsWith("/sendDocument"), true);
+  const body = JSON.parse(calls[0].init.body as string);
+  assertEquals(body.document, "BQAD");
+  assertEquals("reply_markup" in body, false);
+});
+
+Deno.test("sendMedia: ошибка Telegram (файл не найден) → понятная ошибка без токена, с кодом 400", async () => {
+  const { fetchFn } = fakeFetch(400, {
+    ok: false,
+    error_code: 400,
+    description: "Bad Request: wrong file identifier",
+  });
+  const err = await errorOf(
+    sendTelegramMedia(
+      TOKEN,
+      555,
+      { type: "photo", fileId: "bad" },
+      "x",
+      undefined,
+      fetchFn,
+    ),
+  );
+  assertEquals(err.message.includes("Telegram: 400"), true);
+  assertEquals(err.message.includes(TOKEN), false);
 });

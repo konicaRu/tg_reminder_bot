@@ -5,7 +5,7 @@
 // Токен — пароль бота. Ошибки сети в Deno содержат этот адрес целиком, а ошибки попадают в логи.
 // Поэтому здесь все ошибки «чистятся»: наружу выходит только то, что токен не раскрывает.
 
-import type { InlineKeyboardMarkup } from "./telegram.ts";
+import type { Attachment, InlineKeyboardMarkup } from "./telegram.ts";
 
 const TIMEOUT_MS = 10_000;
 
@@ -144,4 +144,36 @@ export async function downloadTelegramFile(
   }
   if (bytes.length > opts.maxBytes) throw tooBig();
   return bytes;
+}
+
+// Отправляет фото или документ по file_id (файл уже лежит в Telegram: скачивать его не нужно)
+// с подписью (HTML) и необязательными кнопками. Возвращает id отправленного сообщения.
+// Если файл больше недоступен, Telegram отвечает ошибкой 400: вызывающий решает, что делать.
+export async function sendTelegramMedia(
+  token: string,
+  chatId: number,
+  attachment: Attachment,
+  caption: string,
+  replyMarkup?: InlineKeyboardMarkup,
+  fetchFn: typeof fetch = fetch,
+): Promise<number> {
+  const isPhoto = attachment.type === "photo";
+  const result = await callTelegramApi(
+    token,
+    isPhoto ? "sendPhoto" : "sendDocument",
+    {
+      chat_id: chatId,
+      [isPhoto ? "photo" : "document"]: attachment.fileId,
+      caption,
+      parse_mode: "HTML",
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    },
+    fetchFn,
+  );
+  const messageId = (result as { message_id?: unknown } | undefined)
+    ?.message_id;
+  if (typeof messageId !== "number") {
+    throw new Error("Telegram: в ответе нет message_id");
+  }
+  return messageId;
 }

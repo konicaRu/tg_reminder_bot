@@ -67,6 +67,8 @@ function setup(
         nag_interval_min: r.nag?.intervalMin ?? null,
         nag_total: r.nag?.total ?? null,
         nag_sent: 0,
+        attachment_file_id: r.attachment?.fileId ?? null,
+        attachment_type: r.attachment?.type ?? null,
       } as Reminder;
       reminders.push(row);
       return Promise.resolve(row);
@@ -124,6 +126,10 @@ function setup(
       if (!r) return Promise.resolve(false);
       if (patch.text !== undefined) r.text = patch.text;
       if (patch.rrule !== undefined) r.rrule = patch.rrule;
+      if (patch.attachment !== undefined) {
+        r.attachment_file_id = patch.attachment?.fileId ?? null;
+        r.attachment_type = patch.attachment?.type ?? null;
+      }
       if (patch.remind_at) {
         r.remind_at = patch.remind_at.toISOString();
         r.nag_sent = 0;
@@ -299,6 +305,7 @@ Deno.test("текст: показываем карточку, в базу НИЧ
       adjusted: null,
       nag: null, // повтор по умолчанию выключен
       rrule: null, // расписания нет: разовое
+      attachment: null, // вложения нет
     },
   });
 });
@@ -1096,4 +1103,119 @@ Deno.test("голос: исключение из распознавания не
     t.sent.at(-1)!.text!.includes("Не удалось разобрать голосовое"),
     true,
   );
+});
+
+// --- Вложения ----------------------------------------------------------------
+
+const PHOTO = { type: "photo" as const, fileId: "AgAD-photo" };
+
+Deno.test("вложение с подписью: карточка со строкой 📎, после OK файл сохранён у напоминания", async () => {
+  const t = setup();
+  await t.h.attachment(t.io, {
+    ...PHOTO,
+    caption: "завтра в 10 отдать документ",
+  });
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(
+    card.text,
+    "Напомню <b>29.10 в 10:00</b>: отдать документ\n📎 Вложение: фото",
+  );
+  assertEquals(t.reminders.length, 0); // до OK ничего не пишем
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].attachment_file_id, "AgAD-photo");
+  assertEquals(t.reminders[0].attachment_type, "photo");
+});
+
+Deno.test("вложение остаётся при переключении повтора и смене времени/текста на карточке", async () => {
+  const t = setup();
+  await t.h.attachment(t.io, { ...PHOTO, caption: "завтра в 10 отдать" });
+  await t.h.callback(t.io, buttonData(t.sent, "Повторять"));
+  await t.h.callback(t.io, buttonData(t.sent, "Другое время"));
+  await t.h.text(t.io, "завтра в 11");
+  await t.h.callback(t.io, buttonData(t.sent, "Текст"));
+  await t.h.text(t.io, "отдать паспорт");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].attachment_file_id, "AgAD-photo");
+  assertEquals(t.reminders[0].text, "отдать паспорт");
+});
+
+Deno.test("вложение без подписи: бот просит «когда и о чём», следующее сообщение становится подписью", async () => {
+  const t = setup();
+  await t.h.attachment(t.io, { type: "document", fileId: "BQAD-doc" });
+  assertEquals(t.sessions.get(CHAT)?.state, "attach_wait");
+  assertEquals(t.sent.at(-1)!.text!.includes("Когда и о чём напомнить"), true);
+  assertEquals(t.reminders.length, 0);
+  await t.h.text(t.io, "через 2 часа проверить договор");
+  const card = t.sent.filter((s) => s.kind === "reply").at(-1)!;
+  assertEquals(card.text!.endsWith("📎 Вложение: документ"), true);
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].attachment_type, "document");
+  assertEquals(t.reminders[0].attachment_file_id, "BQAD-doc");
+});
+
+Deno.test("вложение без подписи: голосовое-ответ тоже работает как подпись", async () => {
+  const t = setup({
+    transcribe: () =>
+      Promise.resolve({ ok: true, text: "завтра в 9 принести" } as Stt),
+  });
+  await t.h.attachment(t.io, PHOTO);
+  await t.h.voice(t.io, { fileId: "V1", duration: 3 });
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  assertEquals(t.reminders[0].attachment_file_id, "AgAD-photo");
+});
+
+Deno.test("вложение с подписью, где даты нет → обычный отказ, вложение не теряем молча (сессия не создаётся)", async () => {
+  const t = setup();
+  await t.h.attachment(t.io, { ...PHOTO, caption: "просто фото" });
+  assertEquals(
+    t.sent.at(-1)!.text!.includes("Не понял, когда напомнить"),
+    true,
+  );
+  assertEquals(t.reminders.length, 0);
+});
+
+Deno.test("правка: «📎 Вложение» → новое фото заменяет старое; «🗑 Убрать вложение» убирает", async () => {
+  const t = setup();
+  await t.h.attachment(t.io, { ...PHOTO, caption: "завтра в 10 отдать" });
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "📎 Вложение"));
+  assertEquals(t.sessions.get(CHAT)?.state, "edit_attach");
+  await t.h.attachment(t.io, { type: "document", fileId: "BQAD-new" });
+  assertEquals(t.reminders[0].attachment_file_id, "BQAD-new");
+  assertEquals(t.reminders[0].attachment_type, "document");
+  assertEquals(t.sessions.has(CHAT), false);
+  assertEquals(t.sent.at(-1)!.text!.includes("Вложение обновлено"), true);
+
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "Убрать вложение"));
+  assertEquals(t.reminders[0].attachment_file_id, null);
+  assertEquals(t.reminders[0].attachment_type, null);
+});
+
+Deno.test("правка вложения: текстом вместо файла → подсказка, состояние остаётся", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 10 отдать");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "📎 Вложение"));
+  await t.h.text(t.io, "привет");
+  assertEquals(t.sent.at(-1)!.text!.includes("Пришли фото или файл"), true);
+  assertEquals(t.sessions.get(CHAT)?.state, "edit_attach");
+});
+
+Deno.test("правка вложения: напоминание успело сработать → «изменить нельзя»", async () => {
+  const t = setup();
+  await t.h.text(t.io, "завтра в 10 отдать");
+  await t.h.callback(t.io, buttonData(t.sent, "OK"));
+  await t.h.list(t.io);
+  await t.h.callback(t.io, buttonData(t.sent, "✏️ 1"));
+  await t.h.callback(t.io, buttonData(t.sent, "📎 Вложение"));
+  t.reminders[0].status = "sent";
+  await t.h.attachment(t.io, PHOTO);
+  assertEquals(t.reminders[0].attachment_file_id ?? null, null);
+  assertEquals(t.sent.at(-1)!.text!.includes("изменить нельзя"), true);
 });
