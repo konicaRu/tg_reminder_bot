@@ -27,6 +27,9 @@ export type TickStore = {
     next: { nagSent?: number; nextRemindAt?: Date },
   ): Promise<boolean>;
   releaseReminder(id: string): Promise<void>; // вернуть в очередь (sending → pending)
+  // «Сдаёмся»: не доставить (403, чат не найден, прошло больше суток). Без next → cancelled;
+  // с next (расписание) → pending на следующее срабатывание. false: пользователь уже решил сам.
+  abandonReminder(id: string, next?: Date): Promise<boolean>;
   getTimezone(chatId: number): Promise<string>; // пояс чата: нужен для расписания («в 9:00»)
 };
 
@@ -50,6 +53,7 @@ export type TickSummary = { claimed: number; sent: number; failed: number };
 
 export async function runTick(deps: TickDeps): Promise<TickSummary> {
   const log = deps.log ?? (() => {});
+  const now = (deps.now ?? (() => new Date()))();
 
   // 1. Забираем наступившие. Это один атомарный запрос: если tick случайно запустили дважды,
   //    второй запуск не увидит этих записей и ничего не отправит повторно.
@@ -107,9 +111,19 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
       failed++;
       // В лог пишем id и причину, но НЕ текст напоминания: он может быть личным.
       log(`Не удалось отправить напоминание ${r.id}: ${errorMessage(err)}`);
-      // Возвращаем в очередь: следующий запуск (через минуту) попробует снова.
       try {
-        await deps.store.releaseReminder(r.id);
+        if (shouldGiveUp(err, r, now)) {
+          // Постоянная ошибка или слишком долго не получается: повторять бессмысленно.
+          // Расписание не теряем: переносим на следующее срабатывание.
+          await deps.store.abandonReminder(
+            r.id,
+            await nextScheduled(deps, r, now, log),
+          );
+          log(`Напоминание ${r.id} не доставлено, больше не пробуем`);
+        } else {
+          // Возвращаем в очередь: следующий запуск (через минуту) попробует снова.
+          await deps.store.releaseReminder(r.id);
+        }
       } catch (err2) {
         log(
           `Не удалось вернуть напоминание ${r.id} в очередь: ${
@@ -141,7 +155,6 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
     // следующего. Считаем его от «сейчас», а не от старого срока: после сбоя tick не должен
     // присылать накопившиеся повторы пачкой.
     const next: { nagSent?: number; nextRemindAt?: Date } = {};
-    const now = (deps.now ?? (() => new Date()))();
     if (isNag) {
       next.nagSent = index;
       if (index < total) {
@@ -188,6 +201,36 @@ export async function runTick(deps: TickDeps): Promise<TickSummary> {
   }
 
   return { claimed: due.length, sent, failed };
+}
+
+// Сколько пытаемся доставить напоминание, считая от его срока, прежде чем сдаться.
+const GIVE_UP_AFTER_MS = 24 * 60 * 60 * 1000;
+
+// Сдаваться пора, если ошибка постоянная (бот заблокирован, чат не найден: повтор ничего не
+// изменит) или с момента срока прошло больше суток. Сеть, 5xx и лимиты считаем временными.
+function shouldGiveUp(err: unknown, r: Reminder, now: Date): boolean {
+  const msg = errorMessage(err);
+  if (msg.includes("Telegram: 403") || msg.includes("chat not found")) {
+    return true;
+  }
+  return now.getTime() - new Date(r.remind_at).getTime() > GIVE_UP_AFTER_MS;
+}
+
+// Следующее срабатывание для напоминания по расписанию (null/undefined, если расписания нет).
+async function nextScheduled(
+  deps: TickDeps,
+  r: Reminder,
+  now: Date,
+  log: (message: string) => void,
+): Promise<Date | undefined> {
+  if (!r.rrule) return undefined;
+  try {
+    const tz = await deps.store.getTimezone(r.chat_id);
+    return nextOccurrence(r.rrule, now, tz) ?? undefined;
+  } catch (err) {
+    log(`Не удалось посчитать следующее для ${r.id}: ${errorMessage(err)}`);
+    return undefined;
+  }
 }
 
 // Текст для подписи к файлу: запас под заголовок «⏰ Напоминание (k из N)» и разметку.

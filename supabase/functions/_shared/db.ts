@@ -370,6 +370,31 @@ export async function snoozeReminder(
   return rows && rows.length > 0 ? { text: rows[0].text as string } : null;
 }
 
+// «Сдаёмся»: напоминание не удаётся доставить (бот заблокирован, чат не найден или прошло больше
+// суток попыток). Без расписания → статус cancelled. С расписанием передаём nextRemindAt:
+// запись возвращается в pending на следующее срабатывание, серия «каждые N минут» обнуляется.
+// Обновление условное (только пока sending): решение пользователя («Готово», удаление, snooze)
+// главнее. Возвращает true, если запись обновилась.
+export async function abandonReminder(
+  db: Db,
+  id: string,
+  nextRemindAt?: Date,
+): Promise<boolean> {
+  const rows = check(
+    await db.from("reminders").update(
+      nextRemindAt
+        ? {
+          status: "pending",
+          remind_at: nextRemindAt.toISOString(),
+          nag_sent: 0,
+        }
+        : { status: "cancelled" },
+    ).eq("id", id).eq("status", "sending").select("id"),
+    "отказ от отправки напоминания",
+  );
+  return (rows?.length ?? 0) > 0;
+}
+
 // Отправка не удалась: возвращаем в pending, следующий запуск tick попробует снова.
 export async function releaseReminder(db: Db, id: string): Promise<void> {
   check(

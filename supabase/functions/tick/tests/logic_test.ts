@@ -52,6 +52,8 @@ function setup(
     clearThrows?: boolean;
     failSendWith?: string; // сообщение ошибки, когда уходит сообщение С вложением
     failTextSend?: boolean; // обычная (без файла) отправка тоже падает
+    failAllWith?: string; // любая отправка падает с этой ошибкой
+    abandonThrows?: boolean; // «сдаться» не получилось (сбой базы)
   } = {},
 ) {
   const sentMessages: {
@@ -66,6 +68,7 @@ function setup(
     next: { nagSent?: number; nextRemindAt?: Date };
   }[] = [];
   const released: string[] = [];
+  const abandoned: { id: string; next?: Date }[] = [];
   const cleared: { chatId: number; messageId: number; afterSends: number }[] =
     [];
   const logs: string[] = [];
@@ -88,6 +91,13 @@ function setup(
       released.push(id);
       return Promise.resolve();
     },
+    abandonReminder: (id, next) => {
+      if (opts.abandonThrows) {
+        return Promise.reject(new Error("база недоступна"));
+      }
+      abandoned.push({ id, next });
+      return Promise.resolve(true);
+    },
     getTimezone: () => Promise.resolve("Europe/Moscow"),
   };
 
@@ -98,6 +108,7 @@ function setup(
     attachment?: unknown,
   ) => {
     sendCalls++;
+    if (opts.failAllWith) return Promise.reject(new Error(opts.failAllWith));
     if (opts.failSendWith && attachment) {
       return Promise.reject(new Error(opts.failSendWith));
     }
@@ -137,6 +148,7 @@ function setup(
     sentMessages,
     marked,
     released,
+    abandoned,
     cleared,
     logs,
     claimCalls: () => claimCalls,

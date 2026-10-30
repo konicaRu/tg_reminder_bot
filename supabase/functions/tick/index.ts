@@ -10,6 +10,7 @@
 // Вся логика — в logic.ts (покрыта тестами). Здесь только проводка.
 
 import {
+  abandonReminder,
   claimDueReminders,
   createDb,
   getSettings,
@@ -40,6 +41,7 @@ const run = () =>
       markReminderSent: (id, messageId, next) =>
         markReminderSent(db, id, messageId, next),
       releaseReminder: (id) => releaseReminder(db, id),
+      abandonReminder: (id, next) => abandonReminder(db, id, next),
       getTimezone: async (chatId) => (await getSettings(db, chatId)).timezone,
     },
     send: (chatId, text, markup, attachment) =>

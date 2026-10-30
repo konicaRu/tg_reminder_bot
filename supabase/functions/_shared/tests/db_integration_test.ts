@@ -12,6 +12,7 @@
 
 import { deepStrictEqual as assertEquals } from "node:assert";
 import {
+  abandonReminder,
   cancelReminder,
   claimDueReminders,
   clearSession,
@@ -482,5 +483,32 @@ dbTest(
     );
     got = await getReminder(db, CHAT, r.id);
     assertEquals([got?.attachment_type, got?.attachment_file_id], [null, null]);
+  },
+);
+
+dbTest(
+  "abandonReminder: без расписания → cancelled; с расписанием → pending на новое время (серия с нуля); не sending → false",
+  async (db) => {
+    const a = await createReminder(db, {
+      chat_id: CHAT,
+      text: "не доставить",
+      remind_at: PAST(),
+    });
+    await claimDueReminders(db); // sending
+    assertEquals(await abandonReminder(db, a.id), true);
+    assertEquals(await abandonReminder(db, a.id), false); // уже cancelled
+
+    const b = await createReminder(db, {
+      chat_id: CHAT,
+      text: "по расписанию",
+      remind_at: PAST(),
+      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    });
+    await claimDueReminders(db);
+    const next = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    assertEquals(await abandonReminder(db, b.id, next), true);
+    const got = await getReminder(db, CHAT, b.id);
+    assertEquals(new Date(got!.remind_at).getTime(), next.getTime());
+    assertEquals(got?.nag_sent, 0);
   },
 );
