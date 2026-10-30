@@ -7,7 +7,7 @@ import type {
   ParseOptions,
   ParseResult,
 } from "./parser/mod.ts";
-import { localParts, offsetString } from "./parser/tz.ts";
+import { addDays, localParts, offsetString, zonedToUtc } from "./parser/tz.ts";
 import { buildRrule, nextOccurrence, parseRrule } from "./repeat.ts";
 
 const MIN_CONFIDENCE = 0.5; // ниже — лучше попросить уточнить, чем угадывать
@@ -30,6 +30,16 @@ export function buildSystemPrompt(opts: ParseOptions): string {
   const localIso = `${p.y}-${pad(p.m)}-${pad(p.d)}T${pad(p.h)}:${pad(p.mi)}:${
     pad(p.s)
   }${offset}`;
+  // Пример для модели, посчитанный от настоящего «сейчас»: «через 2 дня в 13:00» (в поясе пользователя).
+  const inTwoDays = addDays({ y: p.y, m: p.m, d: p.d }, 2);
+  const exampleIso = `${inTwoDays.y}-${pad(inTwoDays.m)}-${
+    pad(inTwoDays.d)
+  }T13:00:00${
+    offsetString(
+      zonedToUtc(inTwoDays.y, inTwoDays.m, inTwoDays.d, 13, 0, tz),
+      tz,
+    )
+  }`;
   const weekday = new Intl.DateTimeFormat("ru-RU", {
     timeZone: tz,
     weekday: "long",
@@ -43,6 +53,9 @@ export function buildSystemPrompt(opts: ParseOptions): string {
     '- rrule: если фраза просит повтор каждый день или по дням недели, строка RRULE со временем, например "FREQ=DAILY;BYHOUR=9;BYMINUTE=0" или "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0". Других видов повторов (раз в N недель, месяц, год) не бывает: тогда верни то, что просит фраза, в том же формате. Если повтора нет, null.',
     "- confidence: число от 0 до 1, насколько ты уверен в разборе. Если в фразе нет даты или времени, поставь 0.",
     `- Если время не указано, используй ${opts.defaultTime}.`,
+    "- Размытые слова: «пара дней» = 2 дня, «пару часов» = 2 часа, «обед» = 13:00, «утром» = 09:00, «днём» = 14:00, «вечером» = 19:00, «ночью» = 23:00.",
+    "- «Через N дней» считай от сегодняшней даты пользователя. remind_at не раньше текущего момента: сегодняшний день подходит, только если время ещё впереди.",
+    `Пример: сейчас ${localIso}; фраза «через пару дней в обед созвон» → {"text": "созвон", "remind_at": "${exampleIso}", "rrule": null, "confidence": 0.9}.`,
     `Пояс пользователя: ${tz} (UTC${offset}). Сейчас у пользователя: ${localIso}, ${weekday}.`,
   ].join("\n");
 }
